@@ -5,9 +5,9 @@ This repository contains the implementation for the paper **Generating High Dime
 ## Generating Initial Channel Dataset from QuaDRiGa
 
 After installing QuaDRiGa ([https://quadriga-channel-model.de/software/](https://quadriga-channel-model.de/software/)), 
-place `main_chgen.m` in the `/quadriga_src/` folder. 
+place `main_chgen.m` in the `/quadriga_src/` folder.
 
-Then, execute the file with MATLAB. After generation, place the output files into `/data/QuaDRiGa`.
+Then, execute the file in MATLAB. After generation, place the output files into `/data/QuaDRiGa`. Alternatively, you can download the dataset from Google Drive [here](https://drive.google.com/file/d/17ho6jTsPh6HD4IkkYSlB9WM9JXF4xwII/view?usp=drive_link).
 
 ## Conda Environment Setup
 
@@ -27,7 +27,7 @@ To create and activate the Conda environment using the provided `environment.yml
    
 ## Training and Inference
 
-First, execute `script_channel_ddim.py` to train the model:
+First, create `/cDDIM_10000/` folder, and execute `script_channel_ddim.py` to train the model:
 
 ```bash
 python script_channel_ddim.py
@@ -49,9 +49,14 @@ The above description is for the quadriga dataset. A version for the DeepMIMO da
 
 This repository was inspired by the following codebases:
 
-- The codebase is mainly based on **conditional MNIST**: [https://github.com/cloneofsimo/minDiffusion](https://github.com/cloneofsimo/minDiffusion)
+- The codebase is primarily based on **conditional MNIST**: [https://github.com/cloneofsimo/minDiffusion](https://github.com/cloneofsimo/minDiffusion)
+  
+Two downstream tasks mentioned in the paper:
 
-Other ideas are referenced in the ([paper](https://www.arxiv.org/abs/2409.03924)).
+- Channel compression - CRNet: [https://github.com/Kylin9511/CRNet](https://github.com/Kylin9511/CRNet)
+- Site-specific beamforming - DLGF: [https://github.com/YuqiangHeng/DLGF](https://github.com/YuqiangHeng/DLGF)
+
+Other ideas are referenced in the [paper](https://www.arxiv.org/abs/2409.03924).
 
 If you want to cite this work, please use the following citation:
 ```bash
