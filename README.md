@@ -1,8 +1,31 @@
-# cDDIM
+# cDDIM (Conditional Denoising Diffusion Implicit Model for wireless channel matrix)
 
 This repository contains the implementation for the paper **Generating High Dimensional User-Specific Wireless Channels using Diffusion Models** ([https://www.arxiv.org/abs/2409.03924](https://www.arxiv.org/abs/2409.03924)).
 
-## Setup
+## Generating Initial Channel Dataset from QuaDRiGa
+
+After installing QuaDRiGa ([https://quadriga-channel-model.de/software/](https://quadriga-channel-model.de/software/)), 
+place `main_chgen.m` in the `/quadriga_src/` folder. 
+
+Then, execute the file with MATLAB. After generation, place the output files into `/data/QuaDRiGa`.
+
+## Conda Environment Setup
+
+To create and activate the Conda environment using the provided `environment.yml`, follow these steps:
+
+1. **Create the environment**:
+
+   ```bash
+   conda env create -f environment.yml
+   ```
+   
+2. **Activate the environment**:
+
+   ```bash
+   conda activate cDDIM
+   ```
+   
+## Training and Inference
 
 First, execute `script_channel_ddim.py` to train the model:
 
@@ -15,11 +38,12 @@ For inference, use the following commands:
 ```bash
 python ddim_inference.py generate
 ```
-to generate channel matrices.Then,
+to generate channel matrices. Then,
 ```bash
 python ddim_inference.py concatenate
 ```
-to concatenate the generated matrices.
+to concatenate the generated matrices. 
+The above description is for the quadriga dataset. A version for the DeepMIMO dataset will be updated.
 
 ## References
 
