@@ -27,7 +27,7 @@ This repository was inspired by the following codebases:
 
 - The codebase is mainly based on **conditional MNIST**: [https://github.com/cloneofsimo/minDiffusion](https://github.com/cloneofsimo/minDiffusion)
 
-Other ideas are referenced in the ([paper](https://www.arxiv.org/abs/2409.03924).
+Other ideas are referenced in the ([paper](https://www.arxiv.org/abs/2409.03924)).
 
 If you want to cite this work, please use the following citation:
 ```bash
