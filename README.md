@@ -2,6 +2,8 @@
 
 This repository contains the implementation for the paper **Generating High Dimensional User-Specific Wireless Channels using Diffusion Models** ([https://www.arxiv.org/abs/2409.03924](https://www.arxiv.org/abs/2409.03924)).
 
+[proposed_approach.pdf](./proposed_approach.pdf)
+
 ## Generating Initial Channel Dataset from QuaDRiGa
 
 After installing QuaDRiGa ([https://quadriga-channel-model.de/software/](https://quadriga-channel-model.de/software/)), 
