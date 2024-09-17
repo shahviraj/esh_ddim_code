@@ -58,7 +58,7 @@ Two downstream tasks mentioned in the paper:
 
 Other ideas are referenced in the [paper](https://www.arxiv.org/abs/2409.03924).
 
-If you want to cite this work, please use the following citation:
+If you find this repository helpful, please cite our work!:
 ```bash
 @article{lee2024generating,
   title={Generating High Dimensional User-Specific Wireless Channels using Diffusion Models},
