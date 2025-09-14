@@ -30,6 +30,7 @@ import scipy
 import matplotlib.cm as cm
 from PIL import Image, ImageDraw, ImageFont
 from scipy.io import savemat
+import os
 
 class ResidualConvBlock(nn.Module):
     def __init__(
@@ -361,7 +362,7 @@ class DDIM(nn.Module):
         return x_i, x_i_store
 
 class BerUMaLDataset(Dataset):
-    def __init__(self, dataset_folder="DeepMIMO_dataset", idx_start=0, idx_end=None, use_deepmimo=True):
+    def __init__(self, dataset_folder="../datasets/DeepMIMO_dataset", idx_start=0, idx_end=None, use_deepmimo=True):
         self.dataset_folder = dataset_folder
         self.idx_start = idx_start
         self.idx_end = idx_end
@@ -385,7 +386,8 @@ class BerUMaLDataset(Dataset):
         # Load all DeepMIMO datasets
         print("Loading DeepMIMO datasets...")
         # Use absolute path to ensure we find the dataset folder
-        dataset_path = os.path.join(os.path.dirname(__file__), '..', self.dataset_folder)
+        #dataset_path = os.path.join(os.path.dirname(__file__), '..', self.dataset_folder)
+        dataset_path = os.path.join(self.dataset_folder)
         data = load_deepmimo_datasets(dataset_path, verbose=True)
         
         # Create ML-ready dataset
@@ -510,7 +512,7 @@ def tensor_to_pil(tensor, scale_factor=5, border_size=1, border_color=(0, 0, 0))
     return new_image
 
 def train():
-    n_epoch = 100 #50000
+    n_epoch = 1000 #50000
     batch_size = 128
     n_T = 256
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -520,7 +522,7 @@ def train():
     save_model = True
 
     num_samples = 10# 1000 #10000
-    save_dir = f'./data/cDDIM_{num_samples}/'
+    save_dir = f'../../outputs/esh_ddim/cDDIM_{num_samples}/'
     ws_test = [0.0] # strength of generative guidance
     n_sample = 10
 
@@ -538,8 +540,8 @@ def train():
     
     if use_deepmimo:
         # Use DeepMIMO dataset
-        berumal_dataset_train = BerUMaLDataset("DeepMIMO_dataset", 0, num_samples, use_deepmimo=True)
-        berumal_dataset_test = BerUMaLDataset("DeepMIMO_dataset", num_samples, num_samples + 1000, use_deepmimo=True)
+        berumal_dataset_train = BerUMaLDataset("../../datasets/DeepMIMO_dataset", 0, num_samples, use_deepmimo=True)
+        berumal_dataset_test = BerUMaLDataset("../../datasets/DeepMIMO_dataset", num_samples, num_samples + 1000, use_deepmimo=True)
     else:
         # Use original BerUMaL dataset
         berumal_dataset_train = BerUMaLDataset("./data/QuaDRiGa/NumUEs_100000_num_BerUMaL_ULA.mat", 0, num_samples, use_deepmimo=False)
@@ -560,7 +562,7 @@ def train():
     optim = torch.optim.Adam(ddim.parameters(), lr=lrate)
 
     nmse_values_test = []  # List to store NMSE values
-
+    os.makedirs(save_dir, exist_ok=True)
     for ep in range(n_epoch):
         print(f'epoch {ep}')
         ddim.train()
@@ -586,9 +588,9 @@ def train():
             optim.step()
 
         # optionally save model
-        if ep % 5000 == 0 : 
-            torch.save(ddim.state_dict(), save_dir + f"model.pth")
-            print('saved model at ' + save_dir + f"model.pth")
+        if ep % 500 == 0 : 
+            torch.save(ddim.state_dict(), save_dir + f"model_{ep}.pth")
+            print('saved model at ' + save_dir + f"model_{ep}.pth")
 
 def demo_variable_context():
     """
