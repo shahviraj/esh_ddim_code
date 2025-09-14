@@ -246,15 +246,14 @@ class ContextUnet(nn.Module):
         if self.use_variable_context:
             # c is expected to be a list of tuples with varying dimensions
             # e.g., [(x_coords, y_coords, z_coords), (los_status,), (antenna_count, freq, power)]
-            if isinstance(c, torch.Tensor) and c.ndim == 2 and c.shape[1] == 10:
-                # Split 10D context into 6 groups: [x, y, z, bs_ant_h, bs_ant_v, ue_ant_h, ue_ant_v, bs_spacing, ue_spacing, los_status]
+            if isinstance(c, torch.Tensor) and c.ndim == 2 and c.shape[1] == 9:
+                # Split 9D context into 5 groups: [x, y, z, bs_ant_h, bs_ant_v, ue_ant_h, ue_ant_v, bs_spacing, ue_spacing]
                 # Group 1: [x, y, z] - user location (3D)
                 # Group 2: [bs_ant_h, bs_ant_v] - BS antenna config (2D)
                 # Group 3: [ue_ant_h, ue_ant_v] - UE antenna config (2D)
                 # Group 4: [bs_spacing] - BS spacing (1D)
                 # Group 5: [ue_spacing] - UE spacing (1D)
-                # Group 6: [los_status] - LoS flag (1D)
-                c = [c[:, :3], c[:, 3:5], c[:, 5:7], c[:, 7:8], c[:, 8:9], c[:, 9:10]]
+                c = [c[:, :3], c[:, 3:5], c[:, 5:7], c[:, 7:8], c[:, 8:9]]
             
             cemb1 = self.context_processor(c).view(-1, self.n_feat * 2, 1, 1)
             cemb2 = self.context_processor2(c).view(-1, self.n_feat, 1, 1)
@@ -461,7 +460,7 @@ class BerUMaLDataset(Dataset):
                 
                 self.data.append(array1[:2, :, :])
                 
-                # Create combined label with user location, antenna configuration, spacing, and LoS
+                # Create combined label with user location, antenna configuration, and spacing
                 if 'user_location' in meta and meta['user_location'] is not None:
                     # Flatten user location and combine with other parameters
                     location = meta['user_location'].flatten() if hasattr(meta['user_location'], 'flatten') else meta['user_location']
@@ -469,34 +468,25 @@ class BerUMaLDataset(Dataset):
                     # Get additional parameters and ensure they are scalars
                     bs_spacing = float(meta.get('bs_spacing', 0.5))  # Default spacing
                     ue_spacing = float(meta.get('ue_spacing', 0.5))  # Default spacing
-                    los_status = float(meta.get('los_status', 0))    # Default to 0 (no LoS)
                     
-                    # Ensure los_status is a scalar (extract from nested array if needed)
-                    if hasattr(los_status, 'item'):
-                        los_status = los_status.item()
-                    elif hasattr(los_status, '__len__') and len(los_status) > 0:
-                        los_status = float(los_status[0])
-                    else:
-                        los_status = float(los_status)
-                    
-                    # Combine: [x, y, z, bs_ant_h, bs_ant_v, ue_ant_h, ue_ant_v, bs_spacing, ue_spacing, los_status]
+                    # Combine: [x, y, z, bs_ant_h, bs_ant_v, ue_ant_h, ue_ant_v, bs_spacing, ue_spacing]
                     combined_label = np.concatenate([
                         location, 
                         [bs_ant_h, bs_ant_v, ue_ant_h, ue_ant_v],
-                        [bs_spacing, ue_spacing, los_status]
+                        [bs_spacing, ue_spacing]
                     ])
                     self.labels.append(combined_label)
                 else:
                     # Fallback to default values
-                    # Use default location [0, 0, 0] + antenna config + default spacing + no LoS
-                    self.labels.append(np.array([0, 0, 0, bs_ant_h, bs_ant_v, ue_ant_h, ue_ant_v, 0.5, 0.5, 0]))
+                    # Use default location [0, 0, 0] + antenna config + default spacing
+                    self.labels.append(np.array([0, 0, 0, bs_ant_h, bs_ant_v, ue_ant_h, ue_ant_v, 0.5, 0.5]))
             else:
                 # Fallback for missing metadata
                 channel_2d = X[i].reshape(8, 4)  # Default shape
                 array1 = np.stack((np.real(channel_2d), np.imag(channel_2d)), axis=0)
                 self.data.append(array1[:2, :, :])
-                # Use default values for combined label: [0, 0, 0, 8, 4, 2, 2, 0.5, 0.5, 0]
-                self.labels.append(np.array([0, 0, 0, 8, 4, 2, 2, 0.5, 0.5, 0]))  # Default location + antenna config + spacing + LoS
+                # Use default values for combined label: [0, 0, 0, 8, 4, 2, 2, 0.5, 0.5]
+                self.labels.append(np.array([0, 0, 0, 8, 4, 2, 2, 0.5, 0.5]))  # Default location + antenna config + spacing
     
     def load_original_dataset(self):
         """Load original BerUMaL dataset format"""
@@ -554,7 +544,7 @@ def train():
     batch_size = 128
     n_T = 256
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    n_classes = 10  # Updated to match our combined label format: [x, y, z, bs_ant_h, bs_ant_v, ue_ant_h, ue_ant_v, bs_spacing, ue_spacing, los_status]
+    n_classes = 9  # Updated to match our combined label format: [x, y, z, bs_ant_h, bs_ant_v, ue_ant_h, ue_ant_v, bs_spacing, ue_spacing]
     n_feat = 256
     lrate = 1e-4
     save_model = True
