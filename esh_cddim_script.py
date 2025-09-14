@@ -200,8 +200,9 @@ class ContextUnet(nn.Module):
         self.timeembed2 = EmbedFC(1, 1 * n_feat)
 
         # Embedder for fixed context or the first element of variable context
-        self.contextembed1 = EmbedFC(n_classes, 2 * n_feat)
-        self.contextembed2 = EmbedFC(n_classes, 1 * n_feat)
+        # The first context (user location) is 3-dimensional
+        self.contextembed1 = EmbedFC(3, 2 * n_feat)
+        self.contextembed2 = EmbedFC(3, 1 * n_feat)
         
         if use_variable_context:
             self.context_processor = SimpleContextProcessor(output_dim=2 * n_feat, first_element_embedder=self.contextembed1)
@@ -242,6 +243,9 @@ class ContextUnet(nn.Module):
         if self.use_variable_context:
             # c is expected to be a list of tuples with varying dimensions
             # e.g., [(x_coords, y_coords, z_coords), (los_status,), (antenna_count, freq, power)]
+            if isinstance(c, torch.Tensor) and c.ndim == 2 and c.shape[1] == 7:
+                c = [c[:, :3], c[:, 3:5], c[:, 5:]]
+            
             cemb1 = self.context_processor(c).view(-1, self.n_feat * 2, 1, 1)
             cemb2 = self.context_processor2(c).view(-1, self.n_feat, 1, 1)
         else:
@@ -534,7 +538,7 @@ def train():
     n_sample = 10
 
     ddim = DDIM(
-    nn_model=ContextUnet(in_channels=2, n_feat=n_feat, n_classes=7),
+    nn_model=ContextUnet(in_channels=2, n_feat=n_feat, n_classes=n_classes),
     betas=(1e-4, 0.02), 
     n_T=n_T, 
     device=device, 
