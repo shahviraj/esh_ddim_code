@@ -134,10 +134,12 @@ class SimpleContextProcessor(nn.Module):
         self.final_projection = None
 
     def forward(self, context_sequence):
+        if isinstance(context_sequence, torch.Tensor):
+            context_sequence = [(context_sequence,)]
         batch_size = context_sequence[0][0].shape[0] if isinstance(context_sequence[0], tuple) else context_sequence[0].shape[0]
         device = context_sequence[0][0].device if isinstance(context_sequence[0], tuple) else context_sequence[0].device
 
-        #print(batch_size)
+        
 
         embedded_contexts = []
         for i, context_tuple in enumerate(context_sequence):
@@ -146,9 +148,11 @@ class SimpleContextProcessor(nn.Module):
             #print(context_tensor.shape)
             if i == 0 and self.first_element_embedder is not None:
                 embedded = self.first_element_embedder(context_tensor)
-                #print(embedded.shape)
+                print(embedded.shape)
+                print(context_tensor.shape[1])
             else:
                 context_dim = context_tensor.shape[1]
+                print(context_dim)
                 
                 embedder_key = f"embedder_{i}_dim_{context_dim}"
 
@@ -160,6 +164,7 @@ class SimpleContextProcessor(nn.Module):
                     ).to(device)
                 
                 embedded = self.context_embedders[embedder_key](context_tensor)
+                print(embedded.shape)
                 
 
             embedded_contexts.append(embedded)
@@ -198,8 +203,9 @@ class ContextUnet(nn.Module):
         self.timeembed2 = EmbedFC(1, 1 * n_feat)
 
         # Embedder for fixed context or the first element of variable context
-        self.contextembed1 = EmbedFC(n_classes, 2 * n_feat)
-        self.contextembed2 = EmbedFC(n_classes, 1 * n_feat)
+        # The first context (user location) is 3-dimensional
+        self.contextembed1 = EmbedFC(3, 2 * n_feat)
+        self.contextembed2 = EmbedFC(3, 1 * n_feat)
         
         if use_variable_context:
             self.context_processor = SimpleContextProcessor(output_dim=2 * n_feat, first_element_embedder=self.contextembed1)
@@ -240,6 +246,15 @@ class ContextUnet(nn.Module):
         if self.use_variable_context:
             # c is expected to be a list of tuples with varying dimensions
             # e.g., [(x_coords, y_coords, z_coords), (los_status,), (antenna_count, freq, power)]
+            if isinstance(c, torch.Tensor) and c.ndim == 2 and c.shape[1] == 9:
+                # Split 9D context into 5 groups: [x, y, z, bs_ant_h, bs_ant_v, ue_ant_h, ue_ant_v, bs_spacing, ue_spacing]
+                # Group 1: [x, y, z] - user location (3D)
+                # Group 2: [bs_ant_h, bs_ant_v] - BS antenna config (2D)
+                # Group 3: [ue_ant_h, ue_ant_v] - UE antenna config (2D)
+                # Group 4: [bs_spacing] - BS spacing (1D)
+                # Group 5: [ue_spacing] - UE spacing (1D)
+                c = [c[:, :3], c[:, 3:5], c[:, 5:7], c[:, 7:8], c[:, 8:9]]
+            
             cemb1 = self.context_processor(c).view(-1, self.n_feat * 2, 1, 1)
             cemb2 = self.context_processor2(c).view(-1, self.n_feat, 1, 1)
         else:
@@ -446,19 +461,33 @@ class BerUMaLDataset(Dataset):
                 
                 self.data.append(array1[:2, :, :])
                 
-                # Use user location as label (rx_positions equivalent)
+                # Create combined label with user location, antenna configuration, and spacing
                 if 'user_location' in meta and meta['user_location'] is not None:
-                    self.labels.append(meta['user_location'])
-                    self.labels.append(np.array([[bs_ant_h, bs_ant_v, ue_ant_h]]))
+                    # Flatten user location and combine with other parameters
+                    location = meta['user_location'].flatten() if hasattr(meta['user_location'], 'flatten') else meta['user_location']
+                    
+                    # Get additional parameters and ensure they are scalars
+                    bs_spacing = float(meta.get('bs_spacing', 0.5))  # Default spacing
+                    ue_spacing = float(meta.get('ue_spacing', 0.5))  # Default spacing
+                    
+                    # Combine: [x, y, z, bs_ant_h, bs_ant_v, ue_ant_h, ue_ant_v, bs_spacing, ue_spacing]
+                    combined_label = np.concatenate([
+                        location, 
+                        [bs_ant_h, bs_ant_v, ue_ant_h, ue_ant_v],
+                        [bs_spacing, ue_spacing]
+                    ])
+                    self.labels.append(combined_label)
                 else:
-                    # Fallback to antenna configuration as label
-                    self.labels.append([bs_ant_h, bs_ant_v, ue_ant_h, ue_ant_v])
+                    # Fallback to default values
+                    # Use default location [0, 0, 0] + antenna config + default spacing
+                    self.labels.append(np.array([0, 0, 0, bs_ant_h, bs_ant_v, ue_ant_h, ue_ant_v, 0.5, 0.5]))
             else:
                 # Fallback for missing metadata
                 channel_2d = X[i].reshape(8, 4)  # Default shape
                 array1 = np.stack((np.real(channel_2d), np.imag(channel_2d)), axis=0)
                 self.data.append(array1[:2, :, :])
-                self.labels.append([8, 4, 2, 2])  # Default antenna config
+                # Use default values for combined label: [0, 0, 0, 8, 4, 2, 2, 0.5, 0.5]
+                self.labels.append(np.array([0, 0, 0, 8, 4, 2, 2, 0.5, 0.5]))  # Default location + antenna config + spacing
     
     def load_original_dataset(self):
         """Load original BerUMaL dataset format"""
@@ -516,18 +545,23 @@ def train():
     batch_size = 128
     n_T = 256
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    n_classes = 3
+    n_classes = 9  # Updated to match our combined label format: [x, y, z, bs_ant_h, bs_ant_v, ue_ant_h, ue_ant_v, bs_spacing, ue_spacing]
     n_feat = 256
     lrate = 1e-4
     save_model = True
 
     num_samples = 10# 1000 #10000
-    save_dir = f'../../outputs/esh_ddim/cDDIM_{num_samples}/'
+
+    # save_dir = f'../../outputs/esh_ddim/cDDIM_{num_samples}/'
+
+    save_dir = f'./data/cDDIM_{num_samples}/'
+    os.makedirs(save_dir, exist_ok=True)
+
     ws_test = [0.0] # strength of generative guidance
     n_sample = 10
 
     ddim = DDIM(
-    nn_model=ContextUnet(in_channels=2, n_feat=n_feat, n_classes=3),
+    nn_model=ContextUnet(in_channels=2, n_feat=n_feat, n_classes=n_classes),
     betas=(1e-4, 0.02), 
     n_T=n_T, 
     device=device, 
