@@ -119,26 +119,87 @@ class EmbedFC(nn.Module):
         return self.model(x)
 
 
+class SimpleContextProcessor(nn.Module):
+    """
+    Processes sequences of tuples by projecting each tuple to a learned embedding
+    and then concatenating them. It can use a dedicated embedder for the first element.
+    """
+    def __init__(self, output_dim=256, emb_dim_per_tuple=128, first_element_embedder=None):
+        super(SimpleContextProcessor, self).__init__()
+        self.output_dim = output_dim
+        self.emb_dim_per_tuple = emb_dim_per_tuple
+        self.first_element_embedder = first_element_embedder
+        self.context_embedders = nn.ModuleDict()
+        self.final_projection = None
+
+    def forward(self, context_sequence):
+        batch_size = context_sequence[0][0].shape[0] if isinstance(context_sequence[0], tuple) else context_sequence[0].shape[0]
+        device = context_sequence[0][0].device if isinstance(context_sequence[0], tuple) else context_sequence[0].device
+
+        embedded_contexts = []
+        for i, context_tuple in enumerate(context_sequence):
+            context_tensor = torch.cat([t.view(batch_size, -1) for t in context_tuple], dim=1) if isinstance(context_tuple, tuple) else context_tuple.view(batch_size, -1)
+            
+            if i == 0 and self.first_element_embedder is not None:
+                embedded = self.first_element_embedder(context_tensor)
+            else:
+                context_dim = context_tensor.shape[1]
+                embedder_key = f"embedder_{i}_dim_{context_dim}"
+
+                if embedder_key not in self.context_embedders:
+                    self.context_embedders[embedder_key] = nn.Sequential(
+                        nn.Linear(context_dim, self.emb_dim_per_tuple),
+                        nn.GELU(),
+                        nn.Linear(self.emb_dim_per_tuple, self.emb_dim_per_tuple)
+                    ).to(device)
+                
+                embedded = self.context_embedders[embedder_key](context_tensor)
+
+            embedded_contexts.append(embedded)
+
+        concatenated_contexts = torch.cat(embedded_contexts, dim=1)
+        
+        concatenated_dim = concatenated_contexts.shape[1]
+        if self.final_projection is None or not isinstance(self.final_projection, nn.Identity) and self.final_projection[0].in_features != concatenated_dim:
+            self.final_projection = nn.Sequential(
+                nn.Linear(concatenated_dim, self.output_dim),
+                nn.GELU(),
+                nn.Linear(self.output_dim, self.output_dim)
+            ).to(device)
+        
+        return self.final_projection(concatenated_contexts)
+
+
 class ContextUnet(nn.Module):
-    def __init__(self, in_channels, n_feat = 256, n_classes=6):
+    def __init__(self, in_channels, n_feat=256, n_classes=6, use_variable_context=False):
         super(ContextUnet, self).__init__()
 
         self.in_channels = in_channels
         self.n_feat = n_feat
         self.n_classes = n_classes
+        self.use_variable_context = use_variable_context
 
         self.init_conv = ResidualConvBlock(in_channels, n_feat, is_res=True)
 
         self.down1 = UnetDown(n_feat, n_feat)
         self.down2 = UnetDown(n_feat, 2 * n_feat)
 
-        # Adjust AvgPool2d to match input feature map size
         self.to_vec = nn.Sequential(nn.AvgPool2d((1, 8)), nn.GELU())
 
-        self.timeembed1 = EmbedFC(1, 2*n_feat)
-        self.timeembed2 = EmbedFC(1, 1*n_feat)
-        self.contextembed1 = EmbedFC(n_classes, 2*n_feat)
-        self.contextembed2 = EmbedFC(n_classes, 1*n_feat)
+        self.timeembed1 = EmbedFC(1, 2 * n_feat)
+        self.timeembed2 = EmbedFC(1, 1 * n_feat)
+
+        # Embedder for fixed context or the first element of variable context
+        self.contextembed1 = EmbedFC(n_classes, 2 * n_feat)
+        self.contextembed2 = EmbedFC(n_classes, 1 * n_feat)
+        
+        if use_variable_context:
+            self.context_processor = SimpleContextProcessor(output_dim=2 * n_feat, first_element_embedder=self.contextembed1)
+            self.context_processor2 = SimpleContextProcessor(output_dim=1 * n_feat, first_element_embedder=self.contextembed2)
+        else:
+            # For clarity, set processors to None when not used
+            self.context_processor = None
+            self.context_processor2 = None
 
         self.up0 = nn.Sequential(
             nn.ConvTranspose2d(2 * n_feat, 2 * n_feat, kernel_size=(1, 8), stride=(1, 8)),
@@ -163,12 +224,21 @@ class ContextUnet(nn.Module):
         down2 = self.down2(down1)
         hiddenvec = self.to_vec(down2)
 
-        # embed context, time step
-        c = c.float()
-        cemb1 = self.contextembed1(c).view(-1, self.n_feat * 2, 1, 1)
+        # embed time step
         temb1 = self.timeembed1(t).view(-1, self.n_feat * 2, 1, 1)
-        cemb2 = self.contextembed2(c).view(-1, self.n_feat, 1, 1)
         temb2 = self.timeembed2(t).view(-1, self.n_feat, 1, 1)
+
+        # Process context based on type
+        if self.use_variable_context:
+            # c is expected to be a list of tuples with varying dimensions
+            # e.g., [(x_coords, y_coords, z_coords), (los_status,), (antenna_count, freq, power)]
+            cemb1 = self.context_processor(c).view(-1, self.n_feat * 2, 1, 1)
+            cemb2 = self.context_processor2(c).view(-1, self.n_feat, 1, 1)
+        else:
+            # Original fixed-size context processing
+            c = c.float()
+            cemb1 = self.contextembed1(c).view(-1, self.n_feat * 2, 1, 1)
+            cemb2 = self.contextembed2(c).view(-1, self.n_feat, 1, 1)
 
         # Combine embeddings with upsampling
         up1 = self.up0(hiddenvec)
@@ -409,6 +479,56 @@ def train():
         if ep % 5000 == 0 : 
             torch.save(ddim.state_dict(), save_dir + f"model.pth")
             print('saved model at ' + save_dir + f"model.pth")
+
+def demo_variable_context():
+    """
+    Demonstration of how to use the new variable context functionality.
+    Shows how to create and use sequences of tuples with varying dimensions.
+    """
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    
+    # Create model with variable context enabled
+    model = ContextUnet(
+        in_channels=2, 
+        n_feat=256, 
+        n_classes=6, 
+        use_variable_context=True
+    ).to(device)
+    
+    # Example input data
+    batch_size = 4
+    x = torch.randn(batch_size, 2, 4, 32).to(device)  # Channel data
+    t = torch.rand(batch_size, 1, 1, 1).to(device)    # Time step
+    context_mask = torch.zeros(batch_size, 1).to(device)
+    
+    # Example variable context: sequence of tuples with different dimensions
+    # Each tuple represents different types of context information
+    context_sequence = [
+        # Tuple 1: 3D coordinates (x, y, z)
+        (torch.randn(batch_size, 1).to(device),  # x coordinate
+         torch.randn(batch_size, 1).to(device),  # y coordinate  
+         torch.randn(batch_size, 1).to(device)), # z coordinate
+        
+        # Tuple 2: Line-of-sight status (binary)
+        (torch.randint(0, 2, (batch_size, 1)).float().to(device),),  # LOS/NLOS status
+        
+        # Tuple 3: Hardware parameters (antenna count, frequency, power)
+        (torch.randint(1, 17, (batch_size, 1)).float().to(device),   # antenna count
+         torch.randn(batch_size, 1).to(device),                      # frequency
+         torch.randn(batch_size, 1).to(device))                      # power
+    ]
+    
+    print("Variable Context Example:")
+    print(f"Context sequence length: {len(context_sequence)}")
+    for i, ctx_tuple in enumerate(context_sequence):
+        print(f"  Tuple {i+1}: {[tensor.shape for tensor in ctx_tuple]}")
+    
+    # Forward pass
+    with torch.no_grad():
+        output = model(x, context_sequence, t, context_mask)
+        print(f"Model output shape: {output.shape}")
+        print("✓ Variable context processing successful!")
+
 
 if __name__ == "__main__":
     train()
