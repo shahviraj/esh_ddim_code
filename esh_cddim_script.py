@@ -133,6 +133,8 @@ class SimpleContextProcessor(nn.Module):
         self.final_projection = None
 
     def forward(self, context_sequence):
+        if isinstance(context_sequence, torch.Tensor):
+            context_sequence = [(context_sequence,)]
         batch_size = context_sequence[0][0].shape[0] if isinstance(context_sequence[0], tuple) else context_sequence[0].shape[0]
         device = context_sequence[0][0].device if isinstance(context_sequence[0], tuple) else context_sequence[0].device
 
