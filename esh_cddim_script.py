@@ -30,6 +30,7 @@ import scipy
 import matplotlib.cm as cm
 from PIL import Image, ImageDraw, ImageFont
 from scipy.io import savemat
+import os
 
 class ResidualConvBlock(nn.Module):
     def __init__(
@@ -528,6 +529,7 @@ def train():
 
     num_samples = 10# 1000 #10000
     save_dir = f'./data/cDDIM_{num_samples}/'
+    os.makedirs(save_dir, exist_ok=True)
     ws_test = [0.0] # strength of generative guidance
     n_sample = 10
 
