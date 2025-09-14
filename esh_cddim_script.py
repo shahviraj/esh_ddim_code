@@ -444,19 +444,24 @@ class BerUMaLDataset(Dataset):
                 
                 self.data.append(array1[:2, :, :])
                 
-                # Use user location as label (rx_positions equivalent)
+                # Create combined label with user location and antenna configuration
                 if 'user_location' in meta and meta['user_location'] is not None:
-                    self.labels.append(meta['user_location'])
-                    self.labels.append(np.array([[bs_ant_h, bs_ant_v, ue_ant_h]]))
+                    # Flatten user location and combine with antenna config
+                    location = meta['user_location'].flatten() if hasattr(meta['user_location'], 'flatten') else meta['user_location']
+                    # Combine: [x, y, z, bs_ant_h, bs_ant_v, ue_ant_h, ue_ant_v]
+                    combined_label = np.concatenate([location, [bs_ant_h, bs_ant_v, ue_ant_h, ue_ant_v]])
+                    self.labels.append(combined_label)
                 else:
-                    # Fallback to antenna configuration as label
-                    self.labels.append([bs_ant_h, bs_ant_v, ue_ant_h, ue_ant_v])
+                    # Fallback to antenna configuration only with default location
+                    # Use default location [0, 0, 0] + antenna config
+                    self.labels.append(np.array([0, 0, 0, bs_ant_h, bs_ant_v, ue_ant_h, ue_ant_v]))
             else:
                 # Fallback for missing metadata
                 channel_2d = X[i].reshape(8, 4)  # Default shape
                 array1 = np.stack((np.real(channel_2d), np.imag(channel_2d)), axis=0)
                 self.data.append(array1[:2, :, :])
-                self.labels.append([8, 4, 2, 2])  # Default antenna config
+                # Use default values for combined label: [0, 0, 0, 8, 4, 2, 2]
+                self.labels.append(np.array([0, 0, 0, 8, 4, 2, 2]))  # Default location + antenna config
     
     def load_original_dataset(self):
         """Load original BerUMaL dataset format"""
@@ -514,7 +519,7 @@ def train():
     batch_size = 128
     n_T = 256
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    n_classes = 3
+    n_classes = 7  # Updated to match our combined label format: [x, y, z, bs_ant_h, bs_ant_v, ue_ant_h, ue_ant_v]
     n_feat = 256
     lrate = 1e-4
     save_model = True
@@ -525,7 +530,7 @@ def train():
     n_sample = 10
 
     ddim = DDIM(
-    nn_model=ContextUnet(in_channels=2, n_feat=n_feat, n_classes=3),
+    nn_model=ContextUnet(in_channels=2, n_feat=n_feat, n_classes=7),
     betas=(1e-4, 0.02), 
     n_T=n_T, 
     device=device, 
