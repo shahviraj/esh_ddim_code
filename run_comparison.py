@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+"""
+Comparison script for ESH-cDDIM vs. baseline cDDIM models.
+
+This script runs a series of evaluations to quantitatively and qualitatively
+compare the performance of the hardware-aware ESH-cDDIM against a baseline
+cDDIM model that only conditions on user location.
+
+Usage:
+    python run_comparison.py --esh_model_path <path> --cddim_model_path <path> --dataset_path <path> --mode all
+"""
+
+import argparse
+import os
+import sys
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+import seaborn as sns
+import json
+from tqdm import tqdm
+from typing import List, Tuple, Dict
+from torchvision.transforms import ToTensor
+
+# Add parent directory to path to import from other scripts
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '.')))
+
+# Imports from our project
+from esh_cddim_inference import ESHcDDIMInference, load_reference_data
+from cddim_comparison_train import ContextUnet as cDDIM_ContextUnet, DDIM as cDDIM_DDIM
+from load_deepmimo_datasets import load_deepmimo_datasets, create_ml_dataset
+from scipy.stats import wasserstein_distance
+
+
+class cDDIMInference:
+    """
+    A simplified inference class for the baseline cDDIM model.
+    """
+    def __init__(self, model_path: str, device: str = "cuda:0" if torch.cuda.is_available() else "cpu"):
+        self.device = device
+        self.model_path = model_path
+        
+        # Model parameters for baseline cDDIM
+        self.n_feat = 256
+        self.n_classes = 3  # Location (x, y, z) only
+        self.n_T = 256
+        self.betas = (1e-4, 0.02)
+        
+        # Initialize model from cddim_comparison_train script
+        self.model = cDDIM_ContextUnet(in_channels=2, n_feat=self.n_feat, n_classes=self.n_classes)
+        
+        self.ddim = cDDIM_DDIM(
+            nn_model=self.model,
+            betas=self.betas,
+            n_T=self.n_T,
+            device=self.device,
+            drop_prob=0.1
+        )
+        self.load_model()
+
+    def load_model(self):
+        """Load the trained model weights."""
+        try:
+            checkpoint = torch.load(self.model_path, map_location=self.device)
+            self.ddim.load_state_dict(checkpoint)
+            self.ddim.to(self.device)
+            self.ddim.eval()
+            print(f"✓ Baseline cDDIM model loaded successfully from {self.model_path}")
+        except Exception as e:
+            print(f"✗ Error loading baseline cDDIM model: {e}")
+            raise
+
+    def generate_channels(self, context_vectors: torch.Tensor, n_samples: int, guidance_scale: float = 0.0) -> torch.Tensor:
+        """Generate channels using the baseline cDDIM model."""
+        if context_vectors.shape[1] != 3:
+            raise ValueError(f"Baseline cDDIM context vectors must have 3 dimensions (location), got {context_vectors.shape[1]}")
+        
+        context_vectors = context_vectors.to(dtype=torch.float32).to(self.device)
+        
+        with torch.no_grad():
+            generated_channels, _ = self.ddim.sample(
+                n_sample=n_samples,
+                c_test=context_vectors,
+                size=(2, 4, 32),  # Channel dimensions
+                device=self.device,
+                guide_w=guidance_scale
+            )
+        return generated_channels
+
+
+def load_reference_data(dataset_path: str, indices: List[int]) -> Tuple[torch.Tensor, List[Dict]]:
+    """
+    Loads specific reference samples from the DeepMIMO dataset by index and
+    applies the same preprocessing used during training.
+    """
+    print(f"Loading {len(indices)} specific samples from {dataset_path}...")
+    
+    # Load the entire dataset structure to access metadata and raw channels
+    data = load_deepmimo_datasets(dataset_path, verbose=False)
+    X_flat, _, all_metadata = create_ml_dataset(data)
+    
+    selected_channels_flat = X_flat[indices]
+    selected_metadata = [all_metadata[i] for i in indices]
+    
+    processed_channels = []
+    for i in tqdm(range(len(selected_channels_flat)), desc="Processing reference channels"):
+        channel_flat = selected_channels_flat[i]
+        meta = selected_metadata[i]
+        
+        # Replicate the channel processing from the training script's BerUMaLDataset
+        bs_ant_h, bs_ant_v = meta['bs_ant_h'], meta['bs_ant_v']
+        ue_ant_h, ue_ant_v = meta['ue_ant_h'], meta['ue_ant_v']
+        
+        channel_2d = channel_flat.reshape(ue_ant_h * ue_ant_v, bs_ant_h * bs_ant_v)
+        
+        # Stack real and imaginary parts
+        array1 = np.stack((np.real(channel_2d), np.imag(channel_2d)), axis=0)
+        
+        # Apply FFT and normalization
+        dft_data = np.fft.fft2(array1[0] + 1j * array1[1])
+        dft_shifted = np.fft.fftshift(dft_data)
+        array1[0] = np.real(dft_shifted)
+        array1[1] = np.imag(dft_shifted)
+        
+        magnitude = np.sqrt(array1[0, :, :]**2 + array1[1, :, :]**2)
+        max_magnitude = np.max(magnitude)
+        if max_magnitude > 0:
+            array1[0, :, :] /= max_magnitude
+            array1[1, :, :] /= max_magnitude
+            
+        processed_channels.append(ToTensor()(array1[:2, :, :]).float())
+
+    return torch.stack(processed_channels), selected_metadata
+
+
+def run_hardware_specific_fidelity_test(esh_inference, cddim_inference, dataset_path, save_dir):
+    """
+    Evaluates how well each model matches the distribution of a specific hardware configuration.
+    """
+    print("\n=== Running Hardware-Specific Fidelity Test ===")
+    
+    # 1. Load data and select a specific hardware configuration to test against
+    print("Loading and filtering dataset for a specific hardware configuration...")
+    data = load_deepmimo_datasets(dataset_path, verbose=False)
+    _, _, metadata = create_ml_dataset(data)
+
+    # Let's choose the first available hardware configuration as our target
+    if not metadata:
+        print("Error: No metadata found in the dataset.")
+        return
+
+    target_config = {
+        'bs_ant_h': metadata[0]['bs_ant_h'], 'bs_ant_v': metadata[0]['bs_ant_v'],
+        'ue_ant_h': metadata[0]['ue_ant_h'], 'ue_ant_v': metadata[0]['ue_ant_v'],
+        'bs_spacing': metadata[0]['bs_spacing'], 'ue_spacing': metadata[0]['ue_spacing']
+    }
+    print(f"Target hardware configuration for test: {target_config}")
+
+    # Filter the dataset for this specific configuration
+    indices = [
+        i for i, m in enumerate(metadata) if
+        m['bs_ant_h'] == target_config['bs_ant_h'] and m['bs_ant_v'] == target_config['bs_ant_v'] and
+        m['ue_ant_h'] == target_config['ue_ant_h'] and m['ue_ant_v'] == target_config['ue_ant_v'] and
+        m['bs_spacing'] == target_config['bs_spacing'] and m['ue_spacing'] == target_config['ue_spacing']
+    ]
+    
+    if len(indices) < 10:
+        print(f"Warning: Found only {len(indices)} samples for the target configuration. Results may not be robust.")
+        if not indices: return
+
+    # Get ground truth channels and prepare conditioning vectors
+    gt_channels, gt_metadata = load_reference_data(dataset_path, indices=indices)
+    
+    esh_cond = torch.tensor(np.array([
+        list(m['user_location'].flatten()) + [m['bs_ant_h'], m['bs_ant_v'], m['ue_ant_h'], m['ue_ant_v'], m['bs_spacing'], m['ue_spacing']]
+        for m in gt_metadata
+    ]))
+    cddim_cond = torch.tensor(np.array([m['user_location'].flatten() for m in gt_metadata]))
+
+    # 2. Generate channels from both models
+    print(f"Generating {len(indices)} samples from both models...")
+    esh_generated = esh_inference.generate_channels(esh_cond, n_samples=len(indices))
+    cddim_generated = cddim_inference.generate_channels(cddim_cond, n_samples=len(indices))
+
+    # 3. Compare distributions
+    print("Calculating statistics and comparing distributions...")
+    gt_stats = esh_inference.calculate_channel_statistics(gt_channels)
+    esh_stats = esh_inference.calculate_channel_statistics(esh_generated)
+    cddim_stats = esh_inference.calculate_channel_statistics(cddim_generated)
+
+    results = {}
+    metrics_to_compare = ['capacity', 'frobenius_norm']
+
+    fig, axes = plt.subplots(1, len(metrics_to_compare), figsize=(16, 6))
+    fig.suptitle('Hardware-Specific Fidelity Comparison', fontsize=16)
+
+    for i, metric in enumerate(metrics_to_compare):
+        # Calculate Wasserstein distances
+        w_dist_esh = wasserstein_distance(gt_stats[metric], esh_stats[metric])
+        w_dist_cddim = wasserstein_distance(gt_stats[metric], cddim_stats[metric])
+        results[f'w_dist_{metric}_esh'] = w_dist_esh
+        results[f'w_dist_{metric}_cddim'] = w_dist_cddim
+
+        print(f"  Wasserstein Distance for '{metric}':")
+        print(f"    - ESH-cDDIM: {w_dist_esh:.4f}")
+        print(f"    - cDDIM:     {w_dist_cddim:.4f}")
+
+        # Plot distributions
+        sns.kdeplot(gt_stats[metric], ax=axes[i], label='Ground Truth', fill=True, color='blue')
+        sns.kdeplot(esh_stats[metric], ax=axes[i], label=f'ESH-cDDIM (W-dist: {w_dist_esh:.2f})', fill=True, color='green')
+        sns.kdeplot(cddim_stats[metric], ax=axes[i], label=f'cDDIM (W-dist: {w_dist_cddim:.2f})', fill=True, color='red')
+        axes[i].set_title(f'Distribution of {metric.replace("_", " ").title()}')
+        axes[i].legend()
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    save_path = os.path.join(save_dir, 'comparison_fidelity_test.png')
+    plt.savefig(save_path, dpi=300)
+    plt.show()
+    print(f"✓ Fidelity comparison plot saved to {save_path}")
+
+    # Save results
+    results_path = os.path.join(save_dir, 'comparison_fidelity_results.json')
+    with open(results_path, 'w') as f:
+        json.dump(results, f, indent=2)
+    print(f"✓ Fidelity comparison results saved to {results_path}")
+
+
+def run_cross_hardware_test(esh_inference, cddim_inference, dataset_path, save_dir):
+    """
+    Visually demonstrates that ESH-cDDIM produces different channels for different
+    hardware configs at the same location, while cDDIM does not.
+    """
+    print("\n=== Running Cross-Hardware Generation Test ===")
+
+    # 1. Load data and find a location with at least two different hardware configs
+    print("Searching for a suitable test location with multiple hardware configurations...")
+    data = load_deepmimo_datasets(dataset_path, verbose=False)
+    _, _, metadata = create_ml_dataset(data)
+
+    # Find two different, compatible hardware configurations from the metadata
+    configs = []
+    for m in metadata:
+        if (m['bs_ant_h'] * m['bs_ant_v'] == 32) and (m['ue_ant_h'] * m['ue_ant_v'] == 4):
+            config_tuple = (m['bs_ant_h'], m['bs_ant_v'], m['ue_ant_h'], m['ue_ant_v'], m['bs_spacing'], m['ue_spacing'])
+            if config_tuple not in configs:
+                configs.append(config_tuple)
+    
+    if len(configs) < 2:
+        print("Error: Could not find at least two different compatible hardware configurations in the dataset.")
+        return
+
+    config_a_tuple, config_b_tuple = configs[0], configs[1]
+    
+    # Find a user location that exists for both configurations (if possible)
+    # For simplicity, we'll just use the first user from each config
+    
+    def get_full_config(cfg_tuple):
+        return {'bs_ant_h': cfg_tuple[0], 'bs_ant_v': cfg_tuple[1], 'ue_ant_h': cfg_tuple[2], 'ue_ant_v': cfg_tuple[3], 'bs_spacing': cfg_tuple[4], 'ue_spacing': cfg_tuple[5]}
+
+    config_a = get_full_config(config_a_tuple)
+    config_b = get_full_config(config_b_tuple)
+
+    # Find a sample for each configuration
+    meta_a = next((m for m in metadata if (m['bs_ant_h'], m['bs_ant_v'], m['ue_ant_h'], m['ue_ant_v'], m['bs_spacing'], m['ue_spacing']) == config_a_tuple), None)
+    meta_b = next((m for m in metadata if (m['bs_ant_h'], m['bs_ant_v'], m['ue_ant_h'], m['ue_ant_v'], m['bs_spacing'], m['ue_spacing']) == config_b_tuple), None)
+    
+    if not meta_a or not meta_b:
+        print("Error: Could not find samples for both selected configurations.")
+        return
+    
+    # Get the indices to load the ground truth channels
+    index_a = metadata.index(meta_a)
+    index_b = metadata.index(meta_b)
+
+    # Load the ground truth channels
+    gt_channel_a, _ = load_reference_data(dataset_path, indices=[index_a])
+    gt_channel_b, _ = load_reference_data(dataset_path, indices=[index_b])
+    gt_channel_a, gt_channel_b = gt_channel_a[0], gt_channel_b[0]
+
+    # Use the same location for both tests
+    test_location = meta_a['user_location']
+    print(f"Using test location: {test_location}")
+    print(f"Config A: {config_a}")
+    print(f"Config B: {config_b}")
+
+    # 2. Prepare conditioning vectors
+    esh_cond_a = torch.tensor([list(test_location) + list(config_a_tuple)]).float()
+    esh_cond_b = torch.tensor([list(test_location) + list(config_b_tuple)]).float()
+    cddim_cond = torch.tensor([test_location]).float()
+
+    # 3. Generate channels
+    print("Generating channels for cross-hardware comparison...")
+    esh_gen_a = esh_inference.generate_channels(esh_cond_a, n_samples=1)[0]
+    esh_gen_b = esh_inference.generate_channels(esh_cond_b, n_samples=1)[0]
+    cddim_gen = cddim_inference.generate_channels(cddim_cond, n_samples=1)[0]
+    
+    # 4. Analyze and Plot Singular Values
+    esh_stats_a = esh_inference.calculate_channel_statistics(esh_gen_a.unsqueeze(0))
+    esh_stats_b = esh_inference.calculate_channel_statistics(esh_gen_b.unsqueeze(0))
+    cddim_stats = esh_inference.calculate_channel_statistics(cddim_gen.unsqueeze(0))
+    gt_stats_a = esh_inference.calculate_channel_statistics(gt_channel_a.unsqueeze(0))
+    gt_stats_b = esh_inference.calculate_channel_statistics(gt_channel_b.unsqueeze(0))
+
+    plt.figure(figsize=(12, 8))
+    # Plot Config A
+    plt.plot(gt_stats_a['singular_values'][0], 'o-', label=f'Ground Truth (Config A)', color='blue', markersize=8)
+    plt.plot(esh_stats_a['singular_values'][0], 's--', label=f'ESH-cDDIM (Config A)', color='green', markersize=6)
+    
+    # Plot Config B
+    plt.plot(gt_stats_b['singular_values'][0], 'o-', label=f'Ground Truth (Config B)', color='orange', markersize=8)
+    plt.plot(esh_stats_b['singular_values'][0], 's--', label=f'ESH-cDDIM (Config B)', color='purple', markersize=6)
+    
+    # Plot Baseline
+    plt.plot(cddim_stats['singular_values'][0], 'x-.', label='Baseline cDDIM (Hardware-Agnostic)', color='red', markersize=8)
+    
+    plt.title('Singular Value Distribution for Different Hardware Configurations', fontsize=16)
+    plt.xlabel('Singular Value Index', fontsize=12)
+    plt.ylabel('Singular Value Magnitude', fontsize=12)
+    plt.yscale('log')
+    plt.legend(fontsize=10)
+    plt.grid(True, which="both", ls="--")
+    
+    save_path = os.path.join(save_dir, 'comparison_cross_hardware_test.png')
+    plt.savefig(save_path, dpi=300)
+    plt.show()
+    print(f"✓ Cross-hardware comparison plot saved to {save_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Run comparison between ESH-cDDIM and baseline cDDIM.')
+    parser.add_argument('--esh_model_path', type=str, required=True, help='Path to the trained ESH-cDDIM model checkpoint')
+    parser.add_argument('--cddim_model_path', type=str, required=True, help='Path to the trained baseline cDDIM model checkpoint')
+    parser.add_argument('--dataset_path', type=str, default="../../datasets/DeepMIMO_dataset_full", help='Path to the DeepMIMO test dataset')
+    parser.add_argument('--mode', type=str, default='all', choices=['all', 'fidelity', 'cross_hardware'], help='Comparison mode to run')
+    parser.add_argument('--save_dir', type=str, default='./results/comparison', help='Directory to save comparison results')
+    args = parser.parse_args()
+
+    os.makedirs(args.save_dir, exist_ok=True)
+
+    # Initialize inference engines for both models
+    esh_inference = ESHcDDIMInference(args.esh_model_path)
+    cddim_inference = cDDIMInference(args.cddim_model_path)
+
+    if args.mode in ['all', 'fidelity']:
+        run_hardware_specific_fidelity_test(esh_inference, cddim_inference, args.dataset_path, args.save_dir)
+    
+    if args.mode in ['all', 'cross_hardware']:
+        run_cross_hardware_test(esh_inference, cddim_inference, args.dataset_path, args.save_dir)
+
+    print("\n✓ Comparison evaluation finished.")
+
+if __name__ == "__main__":
+    main()
