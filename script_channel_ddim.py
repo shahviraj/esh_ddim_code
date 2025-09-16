@@ -288,14 +288,107 @@ class DDIM(nn.Module):
         return x_i, x_i_store
 
 class BerUMaLDataset(Dataset):
-    def __init__(self, data_path, idx_start, idx_end):
-        self.data_path = data_path
+    def __init__(self, dataset_folder="DeepMIMO_dataset", idx_start=0, idx_end=None, use_deepmimo=True):
+        self.dataset_folder = dataset_folder
         self.idx_start = idx_start
         self.idx_end = idx_end
+        self.use_deepmimo = use_deepmimo
         self.load_dataset()
     
     def load_dataset(self):
-        contents = scipy.io.loadmat(self.data_path)
+        if self.use_deepmimo:
+            self.load_deepmimo_dataset()
+        else:
+            self.load_original_dataset()
+    
+    def load_deepmimo_dataset(self):
+        """Load DeepMIMO dataset using our custom loader"""
+        # Import our DeepMIMO loader
+        import sys
+        import os
+        sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+        from load_deepmimo_datasets import load_deepmimo_datasets, create_ml_dataset
+        
+        # Load all DeepMIMO datasets
+        print("Loading DeepMIMO datasets...")
+        # Use absolute path to ensure we find the dataset folder
+        dataset_path = os.path.join(os.path.dirname(__file__), '..', self.dataset_folder)
+        data = load_deepmimo_datasets(dataset_path, verbose=False)
+        
+        # Create ML-ready dataset
+        X, y, metadata = create_ml_dataset(data, include_metadata=True)
+        
+        print(f"Loaded DeepMIMO data: {X.shape[0]} samples")
+        
+        # Convert to the format expected by the diffusion model
+        self.data = []
+        self.labels = []
+        
+        # Determine end index
+        if self.idx_end is None:
+            self.idx_end = X.shape[0]
+        
+        # Ensure indices are within bounds
+        self.idx_start = max(0, min(self.idx_start, X.shape[0]))
+        self.idx_end = max(self.idx_start, min(self.idx_end, X.shape[0]))
+        
+        print(f"Processing samples {self.idx_start} to {self.idx_end}")
+        
+        for i in range(self.idx_start, self.idx_end):
+            # Reshape flattened channel data back to 2D
+            # Assuming the channel was flattened as (num_ant_BS * num_ant_UE,)
+            # We need to determine the antenna dimensions from metadata
+            if i < len(metadata):
+                meta = metadata[i]
+                bs_ant_h = meta.get('bs_ant_h', 8)  # Default values
+                bs_ant_v = meta.get('bs_ant_v', 4)
+                ue_ant_h = meta.get('ue_ant_h', 2)
+                ue_ant_v = meta.get('ue_ant_v', 2)
+                
+                # Reshape to (num_ant_BS, num_ant_UE) format
+                channel_2d = X[i].reshape( ue_ant_h * ue_ant_v, bs_ant_h * bs_ant_v)
+                
+                print(channel_2d.shape)
+                
+                # Convert to complex and then to real/imaginary parts
+                # For now, we'll use the real part as channel data
+                # You may need to adjust this based on your specific channel representation
+                channel_complex =  channel_2d  # Assuming X[i] is already complex
+                
+                # Stack real and imaginary parts
+                array1 = np.stack((np.real(channel_complex), np.imag(channel_complex)), axis=0)
+                
+                # Apply FFT and normalization similar to original code
+                dft_data = np.fft.fft2(array1[0] + 1j * array1[1])
+                dft_shifted = np.fft.fftshift(dft_data)
+                array1[0] = np.real(dft_shifted)
+                array1[1] = np.imag(dft_shifted)
+                
+                # Normalize by maximum magnitude
+                magnitude = np.sqrt(array1[0, :, :]**2 + array1[1, :, :]**2)
+                max_magnitude = np.max(magnitude)
+                if max_magnitude > 0:
+                    array1[0, :, :] /= max_magnitude
+                    array1[1, :, :] /= max_magnitude
+                
+                self.data.append(array1[:2, :, :])
+                
+                # Use user location as label (rx_positions equivalent)
+                if 'user_location' in meta and meta['user_location'] is not None:
+                    self.labels.append(meta['user_location'])
+                else:
+                    # Fallback to antenna configuration as label
+                    self.labels.append([bs_ant_h, bs_ant_v, ue_ant_h, ue_ant_v])
+            else:
+                # Fallback for missing metadata
+                channel_2d = X[i].reshape(8, 4)  # Default shape
+                array1 = np.stack((np.real(channel_2d), np.imag(channel_2d)), axis=0)
+                self.data.append(array1[:2, :, :])
+                self.labels.append([8, 4, 2, 2])  # Default antenna config
+    
+    def load_original_dataset(self):
+        """Load original BerUMaL dataset format"""
+        contents = scipy.io.loadmat(self.dataset_folder)
         array1 = contents['H_set'][self.idx_start:self.idx_end,:,:] # (10000, 4, 32)
         array1 = np.stack((np.real(array1[:,:,:]), np.imag(array1[:,:,:])), axis=1)
         array2 = array1.copy()
@@ -348,7 +441,7 @@ def train():
     n_epoch = 50000
     batch_size = 128
     n_T = 256
-    device = "cuda:0"
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
     n_classes = 3
     n_feat = 256
     lrate = 1e-4
@@ -368,9 +461,17 @@ def train():
     )
     ddim.to(device)
 
-    # Load BerUMaL dataset
-    berumal_dataset_train = BerUMaLDataset("./data/QuaDRiGa/NumUEs_100000_num_BerUMaL_ULA.mat",0,num_samples)
-    berumal_dataset_test = BerUMaLDataset("./data/QuaDRiGa/NumUEs_100000_num_BerUMaL_ULA.mat",90000,100000)
+    # Load DeepMIMO dataset (or original BerUMaL dataset)
+    use_deepmimo = True  # Set to False to use original BerUMaL dataset
+    
+    if use_deepmimo:
+        # Use DeepMIMO dataset
+        berumal_dataset_train = BerUMaLDataset("DeepMIMO_dataset", 0, num_samples, use_deepmimo=True)
+        berumal_dataset_test = BerUMaLDataset("DeepMIMO_dataset", num_samples, num_samples + 1000, use_deepmimo=True)
+    else:
+        # Use original BerUMaL dataset
+        berumal_dataset_train = BerUMaLDataset("./data/QuaDRiGa/NumUEs_100000_num_BerUMaL_ULA.mat", 0, num_samples, use_deepmimo=False)
+        berumal_dataset_test = BerUMaLDataset("./data/QuaDRiGa/NumUEs_100000_num_BerUMaL_ULA.mat", 90000, 100000, use_deepmimo=False)
 
     # Create a DataLoader for the BerUMaL dataset
     dataloader_train = DataLoader(berumal_dataset_train, batch_size=batch_size, shuffle=True)
