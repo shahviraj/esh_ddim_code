@@ -40,6 +40,7 @@ from esh_cddim_script import (
     ResidualConvBlock, UnetDown, UnetUp, EmbedFC, SimpleContextProcessor, 
     ContextUnet, ddim_schedules, DDIM, BerUMaLDataset
 )
+from load_deepmimo_datasets import load_deepmimo_datasets
 
 class ESHcDDIMInference:
     """
@@ -425,6 +426,91 @@ class ESHcDDIMInference:
         
         return results
 
+    def calculate_channel_statistics(self, channels: torch.Tensor) -> Dict[str, np.ndarray]:
+        """
+        Calculate key statistics for a batch of channel matrices.
+        
+        Parameters:
+        - channels: Tensor of channel matrices
+        
+        Returns:
+        - Dictionary of statistics (e.g., capacity, frobenius_norm)
+        """
+        channels_np = channels.cpu().numpy()
+        
+        capacities = []
+        frobenius_norms = []
+        singular_values = []
+        
+        for i in range(channels_np.shape[0]):
+            H = channels_np[i, 0] + 1j * channels_np[i, 1]
+            
+            # SVD
+            try:
+                U, S, Vh = np.linalg.svd(H, full_matrices=False)
+                singular_values.append(S)
+            except np.linalg.LinAlgError:
+                S = np.zeros(min(H.shape)) # Handle cases where SVD fails
+
+            # Capacity
+            capacity = np.sum(np.log2(1 + S**2))
+            capacities.append(capacity)
+            
+            # Frobenius norm
+            fro_norm = np.linalg.norm(H, 'fro')
+            frobenius_norms.append(fro_norm)
+            
+        return {
+            'capacity': np.array(capacities),
+            'frobenius_norm': np.array(frobenius_norms),
+            'singular_values': singular_values # This will be a list of arrays
+        }
+
+def get_hardware_configs_from_dataset(dataset_path: str, n_configs: int = 5) -> List[Dict]:
+    """
+    Load DeepMIMO dataset and extract a random sample of hardware configurations
+    that are compatible with the model's output size.
+    """
+    print(f"Loading hardware configurations from {dataset_path}...")
+    try:
+        loaded_data = load_deepmimo_datasets(dataset_path, verbose=False)
+        config_df = loaded_data['configurations']
+        
+        if config_df.empty:
+            print("Warning: No hardware configurations found in the dataset.")
+            return []
+
+        config_df = config_df.rename(columns={
+            'bs_antennas_horizontal': 'bs_ant_h',
+            'bs_antennas_vertical': 'bs_ant_v',
+            'ue_antennas_horizontal': 'ue_ant_h',
+            'ue_antennas_vertical': 'ue_ant_v',
+            'bs_antenna_spacing': 'bs_spacing',
+            'ue_antenna_spacing': 'ue_spacing'
+        })
+
+        # Filter for configurations compatible with model output size (e.g., 4x32)
+        compatible_configs = config_df[
+            (config_df['bs_ant_h'] * config_df['bs_ant_v'] == 32) & 
+            (config_df['ue_ant_h'] * config_df['ue_ant_v'] == 4)
+        ]
+
+        if compatible_configs.empty:
+            print("Warning: No compatible hardware configurations found in the dataset.")
+            return []
+            
+        compatible_configs = compatible_configs.drop_duplicates().reset_index(drop=True)
+        
+        n_samples = min(n_configs, len(compatible_configs))
+        sampled_configs = compatible_configs.sample(n=n_samples).to_dict(orient='records')
+        
+        print(f"Found {len(compatible_configs)} compatible configurations. Sampled {len(sampled_configs)}.")
+        return sampled_configs
+
+    except Exception as e:
+        print(f"Warning: Could not load hardware configs from dataset: {e}. Using default hardware configs.")
+        return []
+
 def create_test_context_vectors(n_samples: int = 100, 
                                device: str = "cuda:0" if torch.cuda.is_available() else "cpu") -> torch.Tensor:
     """
@@ -492,10 +578,18 @@ def main():
         print("  generate - Generate synthetic channels")
         print("  evaluate - Evaluate generated channels against reference")
         print("  visualize - Visualize channel characteristics")
-        print("  hardware - Analyze hardware awareness")
+        print("  hardware --config_dataset_path <path> - Analyze hardware awareness using configs from dataset")
         sys.exit(1)
     
     mode = sys.argv[1]
+
+    config_dataset_path = None
+    if '--config_dataset_path' in sys.argv:
+        try:
+            config_dataset_path = sys.argv[sys.argv.index('--config_dataset_path') + 1]
+        except IndexError:
+            print("Error: --config_dataset_path requires a value.")
+            sys.exit(1)
     
     # Configuration
     model_path = "./data/cDDIM_10000/model_2000.pth"  # Update this path
@@ -588,14 +682,20 @@ def main():
         # Create base context
         base_context = create_test_context_vectors(1, device)
         
-        # Define hardware variations
-        hardware_variations = [
-            {'bs_ant_h': 8, 'bs_ant_v': 4, 'ue_ant_h': 2, 'ue_ant_v': 2, 'bs_spacing': 0.5, 'ue_spacing': 0.5},
-            {'bs_ant_h': 16, 'bs_ant_v': 8, 'ue_ant_h': 2, 'ue_ant_v': 2, 'bs_spacing': 0.5, 'ue_spacing': 0.5},
-            {'bs_ant_h': 32, 'bs_ant_v': 16, 'ue_ant_h': 2, 'ue_ant_v': 2, 'bs_spacing': 0.5, 'ue_spacing': 0.5},
-            {'bs_ant_h': 8, 'bs_ant_v': 4, 'ue_ant_h': 4, 'ue_ant_v': 4, 'bs_spacing': 0.5, 'ue_spacing': 0.5},
-            {'bs_ant_h': 8, 'bs_ant_v': 4, 'ue_ant_h': 2, 'ue_ant_v': 2, 'bs_spacing': 0.7, 'ue_spacing': 0.7},
-        ]
+        hardware_variations = []
+        if config_dataset_path:
+            hardware_variations = get_hardware_configs_from_dataset(config_dataset_path, n_configs=5)
+
+        if not hardware_variations:
+            print("No hardware configurations loaded from dataset, using default list.")
+            # Define hardware variations
+            hardware_variations = [
+                {'bs_ant_h': 8, 'bs_ant_v': 4, 'ue_ant_h': 2, 'ue_ant_v': 2, 'bs_spacing': 0.5, 'ue_spacing': 0.5},
+                {'bs_ant_h': 16, 'bs_ant_v': 2, 'ue_ant_h': 2, 'ue_ant_v': 2, 'bs_spacing': 0.5, 'ue_spacing': 0.5},
+                {'bs_ant_h': 32, 'bs_ant_v': 1, 'ue_ant_h': 2, 'ue_ant_v': 2, 'bs_spacing': 0.5, 'ue_spacing': 0.5},
+                {'bs_ant_h': 8, 'bs_ant_v': 4, 'ue_ant_h': 4, 'ue_ant_v': 1, 'bs_spacing': 0.5, 'ue_spacing': 0.5},
+                {'bs_ant_h': 8, 'bs_ant_v': 4, 'ue_ant_h': 2, 'ue_ant_v': 2, 'bs_spacing': 0.7, 'ue_spacing': 0.7},
+            ]
         
         # Analyze hardware awareness
         results = inference.analyze_hardware_awareness(

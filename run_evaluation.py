@@ -19,9 +19,10 @@ import seaborn as sns
 from pathlib import Path
 import json
 from datetime import datetime
+from scipy.stats import wasserstein_distance
 
 # Import our inference class
-from esh_cddim_inference import ESHcDDIMInference, create_test_context_vectors, load_reference_data
+from esh_cddim_inference import ESHcDDIMInference, create_test_context_vectors, load_reference_data, get_hardware_configs_from_dataset
 
 def run_spatial_generalization_evaluation(inference, save_dir, n_samples=100):
     """
@@ -106,23 +107,97 @@ def run_spatial_generalization_evaluation(inference, save_dir, n_samples=100):
     print(f"✓ Spatial generalization evaluation completed. Results saved to {save_dir}")
     return results
 
-def run_hardware_awareness_evaluation(inference, save_dir, n_samples=50):
+def run_statistical_fidelity_evaluation(inference, save_dir, n_samples=1000):
+    """
+    Evaluate statistical fidelity using Wasserstein distance on key metrics.
+    """
+    print("=== Statistical Fidelity Evaluation ===")
+    
+    # 1. Load a large batch of reference data
+    try:
+        ref_channels, ref_context = load_reference_data(n_samples=n_samples)
+    except Exception as e:
+        print(f"Failed to load reference data: {e}")
+        return
+
+    # 2. Generate synthetic channels using the same contexts
+    print(f"Generating {n_samples} synthetic channels for comparison...")
+    generated_channels = inference.generate_channels(
+        context_vectors=ref_context,
+        n_samples=n_samples,
+        guidance_scale=0.0
+    )
+
+    # 3. Calculate statistics for both sets
+    print("Calculating statistics for reference and generated channels...")
+    ref_stats = inference.calculate_channel_statistics(ref_channels)
+    gen_stats = inference.calculate_channel_statistics(generated_channels)
+
+    metrics_to_compare = ['capacity', 'frobenius_norm']
+    results = {}
+
+    # 4. Compare distributions and visualize
+    fig, axes = plt.subplots(1, len(metrics_to_compare), figsize=(8 * len(metrics_to_compare), 6))
+    if len(metrics_to_compare) == 1:
+        axes = [axes]
+
+    for i, metric in enumerate(metrics_to_compare):
+        ref_values = ref_stats[metric]
+        gen_values = gen_stats[metric]
+        
+        # Calculate Wasserstein distance
+        w_dist = wasserstein_distance(ref_values, gen_values)
+        results[f'wasserstein_distance_{metric}'] = w_dist
+        print(f"  Wasserstein distance for {metric}: {w_dist:.4f}")
+
+        # Plot distributions
+        sns.kdeplot(ref_values, ax=axes[i], label='Reference', fill=True)
+        sns.kdeplot(gen_values, ax=axes[i], label='Generated', fill=True)
+        axes[i].set_title(f'Distribution of Channel {metric.capitalize().replace("_", " ")}\n(W-Distance: {w_dist:.4f})')
+        axes[i].set_xlabel(metric.capitalize().replace("_", " "))
+        axes[i].set_ylabel('Density')
+        axes[i].legend()
+
+    plt.tight_layout()
+    save_path = os.path.join(save_dir, 'statistical_fidelity_evaluation.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.show()
+    print(f"✓ Statistical fidelity visualization saved to {save_path}")
+
+    # Save quantitative results
+    results_path = os.path.join(save_dir, 'statistical_fidelity_results.json')
+    with open(results_path, 'w') as f:
+        json.dump(results, f, indent=2)
+    print(f"✓ Statistical fidelity metrics saved to {results_path}")
+    
+    return results
+
+def run_hardware_awareness_evaluation(inference, save_dir, n_samples=50, config_dataset_path=None):
     """
     Evaluate hardware awareness by testing different antenna configurations.
     """
     print("=== Hardware Awareness Evaluation ===")
     
-    # Define hardware configurations to test
-    hardware_configs = [
-        {'name': 'Small_BS_Small_UE', 'bs_ant_h': 4, 'bs_ant_v': 2, 'ue_ant_h': 1, 'ue_ant_v': 1, 'bs_spacing': 0.5, 'ue_spacing': 0.5},
-        {'name': 'Medium_BS_Small_UE', 'bs_ant_h': 8, 'bs_ant_v': 4, 'ue_ant_h': 1, 'ue_ant_v': 1, 'bs_spacing': 0.5, 'ue_spacing': 0.5},
-        {'name': 'Large_BS_Small_UE', 'bs_ant_h': 16, 'bs_ant_v': 8, 'ue_ant_h': 1, 'ue_ant_v': 1, 'bs_spacing': 0.5, 'ue_spacing': 0.5},
-        {'name': 'Medium_BS_Medium_UE', 'bs_ant_h': 8, 'bs_ant_v': 4, 'ue_ant_h': 2, 'ue_ant_v': 2, 'bs_spacing': 0.5, 'ue_spacing': 0.5},
-        {'name': 'Large_BS_Medium_UE', 'bs_ant_h': 16, 'bs_ant_v': 8, 'ue_ant_h': 2, 'ue_ant_v': 2, 'bs_spacing': 0.5, 'ue_spacing': 0.5},
-        {'name': 'Dense_Spacing', 'bs_ant_h': 8, 'bs_ant_v': 4, 'ue_ant_h': 2, 'ue_ant_v': 2, 'bs_spacing': 0.3, 'ue_spacing': 0.3},
-        {'name': 'Sparse_Spacing', 'bs_ant_h': 8, 'bs_ant_v': 4, 'ue_ant_h': 2, 'ue_ant_v': 2, 'bs_spacing': 0.7, 'ue_spacing': 0.7},
-    ]
-    
+    hardware_configs = []
+    if config_dataset_path:
+        hardware_configs = get_hardware_configs_from_dataset(config_dataset_path, n_configs=7)
+        # Add descriptive names for plotting
+        for config in hardware_configs:
+            name = f"BS{config['bs_ant_h']}x{config['bs_ant_v']}_UE{config['ue_ant_h']}x{config['ue_ant_v']}_S{config['bs_spacing']:.1f}"
+            config['name'] = name
+
+    if not hardware_configs:
+        print("No hardware configurations loaded from dataset, using default list.")
+        # Define hardware configurations to test
+        hardware_configs = [
+            {'name': 'BS8x4_UE2x2_S0.5', 'bs_ant_h': 8, 'bs_ant_v': 4, 'ue_ant_h': 2, 'ue_ant_v': 2, 'bs_spacing': 0.5, 'ue_spacing': 0.5},
+            {'name': 'BS16x2_UE2x2_S0.5', 'bs_ant_h': 16, 'bs_ant_v': 2, 'ue_ant_h': 2, 'ue_ant_v': 2, 'bs_spacing': 0.5, 'ue_spacing': 0.5},
+            {'name': 'BS32x1_UE2x2_S0.5', 'bs_ant_h': 32, 'bs_ant_v': 1, 'ue_ant_h': 2, 'ue_ant_v': 2, 'bs_spacing': 0.5, 'ue_spacing': 0.5},
+            {'name': 'BS8x4_UE4x1_S0.5', 'bs_ant_h': 8, 'bs_ant_v': 4, 'ue_ant_h': 4, 'ue_ant_v': 1, 'bs_spacing': 0.5, 'ue_spacing': 0.5},
+            {'name': 'BS8x4_UE2x2_S0.3', 'bs_ant_h': 8, 'bs_ant_v': 4, 'ue_ant_h': 2, 'ue_ant_v': 2, 'bs_spacing': 0.3, 'ue_spacing': 0.3},
+            {'name': 'BS8x4_UE2x2_S0.7', 'bs_ant_h': 8, 'bs_ant_v': 4, 'ue_ant_h': 2, 'ue_ant_v': 2, 'bs_spacing': 0.7, 'ue_spacing': 0.7},
+        ]
+
     results = {}
     
     for config in hardware_configs:
@@ -342,7 +417,7 @@ def run_state_awareness_evaluation(inference, save_dir, n_samples=50):
     print(f"✓ State awareness evaluation completed. Results saved to {save_dir}")
     return results
 
-def run_comprehensive_evaluation(inference, save_dir, n_samples=100):
+def run_comprehensive_evaluation(inference, save_dir, n_samples=100, config_dataset_path=None):
     """
     Run all evaluations and generate a comprehensive report.
     """
@@ -351,8 +426,9 @@ def run_comprehensive_evaluation(inference, save_dir, n_samples=100):
     all_results = {}
     
     # Run all evaluations
+    all_results['statistical'] = run_statistical_fidelity_evaluation(inference, save_dir, n_samples)
     all_results['spatial'] = run_spatial_generalization_evaluation(inference, save_dir, n_samples)
-    all_results['hardware'] = run_hardware_awareness_evaluation(inference, save_dir, n_samples)
+    all_results['hardware'] = run_hardware_awareness_evaluation(inference, save_dir, n_samples, config_dataset_path=config_dataset_path)
     all_results['state'] = run_state_awareness_evaluation(inference, save_dir, n_samples)
     
     # Generate summary report
@@ -362,6 +438,7 @@ def run_comprehensive_evaluation(inference, save_dir, n_samples=100):
         'n_samples': n_samples,
         'evaluations_completed': list(all_results.keys()),
         'summary': {
+            'statistical_evaluation': 'Completed distribution comparison using Wasserstein distance',
             'spatial_evaluation': 'Completed spatial generalization test across grid locations',
             'hardware_evaluation': 'Completed hardware awareness test across antenna configurations',
             'state_evaluation': 'Completed state awareness test across different heights'
@@ -378,37 +455,40 @@ def run_comprehensive_evaluation(inference, save_dir, n_samples=100):
 def main():
     parser = argparse.ArgumentParser(description='Run ESH-cDDIM evaluation')
     parser.add_argument('--mode', type=str, default='all', 
-                       choices=['all', 'spatial', 'hardware', 'state'],
+                       choices=['all', 'spatial', 'hardware', 'state', 'statistical'],
                        help='Evaluation mode to run')
     parser.add_argument('--model_path', type=str, required=True,
                        help='Path to the trained model checkpoint')
-    parser.add_argument('--save_dir', type=str, default='./results/evaluation',
-                       help='Directory to save evaluation results')
+    parser.add_argument('--config_dataset_path', type=str, default="../../datasets/DeepMIMO_dataset_full",
+                       help='Path to dataset for sampling hardware configs for hardware awareness test.')
     parser.add_argument('--n_samples', type=int, default=100,
                        help='Number of samples to generate for evaluation')
     
     args = parser.parse_args()
     
-    # Create save directory
-    os.makedirs(args.save_dir, exist_ok=True)
-    
-    # Initialize inference
+    # Initialize inference (this will create unique results directory)
     try:
         inference = ESHcDDIMInference(args.model_path)
         print(f"✓ Model loaded successfully from {args.model_path}")
+        print(f"Results will be saved to: {inference.results_dir}")
     except Exception as e:
         print(f"✗ Failed to load model: {e}")
         return
     
+    # Use the unique results directory from the inference class
+    save_dir = inference.results_dir
+    
     # Run evaluation based on mode
     if args.mode == 'all':
-        run_comprehensive_evaluation(inference, args.save_dir, args.n_samples)
+        run_comprehensive_evaluation(inference, save_dir, args.n_samples, config_dataset_path=args.config_dataset_path)
     elif args.mode == 'spatial':
-        run_spatial_generalization_evaluation(inference, args.save_dir, args.n_samples)
+        run_spatial_generalization_evaluation(inference, save_dir, args.n_samples)
     elif args.mode == 'hardware':
-        run_hardware_awareness_evaluation(inference, args.save_dir, args.n_samples)
+        run_hardware_awareness_evaluation(inference, save_dir, args.n_samples, config_dataset_path=args.config_dataset_path)
     elif args.mode == 'state':
-        run_state_awareness_evaluation(inference, args.save_dir, args.n_samples)
+        run_state_awareness_evaluation(inference, save_dir, args.n_samples)
+    elif args.mode == 'statistical':
+        run_statistical_fidelity_evaluation(inference, save_dir, args.n_samples)
     
     print("✓ Evaluation completed successfully!")
 
