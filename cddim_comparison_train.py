@@ -31,7 +31,6 @@ import matplotlib.cm as cm
 from PIL import Image, ImageDraw, ImageFont
 from scipy.io import savemat
 import os
-
 class ResidualConvBlock(nn.Module):
     def __init__(
         self, in_channels: int, out_channels: int, is_res: bool = False
@@ -120,101 +119,31 @@ class EmbedFC(nn.Module):
         return self.model(x)
 
 
-class SimpleContextProcessor(nn.Module):
-    """
-    Processes sequences of tuples by projecting each tuple to a learned embedding
-    and then concatenating them. It can use a dedicated embedder for the first element.
-    """
-    def __init__(self, output_dim=256, emb_dim_per_tuple=128, first_element_embedder=None):
-        super(SimpleContextProcessor, self).__init__()
-        self.output_dim = output_dim
-        self.emb_dim_per_tuple = emb_dim_per_tuple
-        self.first_element_embedder = first_element_embedder
-        self.context_embedders = nn.ModuleDict()
-        self.final_projection = None
-
-    def forward(self, context_sequence):
-        if isinstance(context_sequence, torch.Tensor):
-            context_sequence = [(context_sequence,)]
-        batch_size = context_sequence[0][0].shape[0] if isinstance(context_sequence[0], tuple) else context_sequence[0].shape[0]
-        device = context_sequence[0][0].device if isinstance(context_sequence[0], tuple) else context_sequence[0].device
-
-        
-
-        embedded_contexts = []
-        for i, context_tuple in enumerate(context_sequence):
-            #print(context_tuple)
-            context_tensor = torch.cat([t.view(batch_size, -1) for t in context_tuple], dim=1) if isinstance(context_tuple, tuple) else context_tuple.view(batch_size, -1)
-            #print(context_tensor.shape)
-            if i == 0 and self.first_element_embedder is not None:
-                embedded = self.first_element_embedder(context_tensor)
-                #print(embedded.shape)
-                #print(context_tensor.shape[1])
-            else:
-                context_dim = context_tensor.shape[1]
-                #print(context_dim)
-                
-                embedder_key = f"embedder_{i}_dim_{context_dim}"
-
-                if embedder_key not in self.context_embedders:
-                    self.context_embedders[embedder_key] = nn.Sequential(
-                        nn.Linear(context_dim, self.emb_dim_per_tuple),
-                        nn.GELU(),
-                        nn.Linear(self.emb_dim_per_tuple, self.emb_dim_per_tuple)
-                    ).to(device)
-                
-                embedded = self.context_embedders[embedder_key](context_tensor)
-                #print(embedded.shape)
-                
-
-            embedded_contexts.append(embedded)
-
-        
-        concatenated_contexts = torch.cat(embedded_contexts, dim=1)
-        
-        concatenated_dim = concatenated_contexts.shape[1]
-        if self.final_projection is None or not isinstance(self.final_projection, nn.Identity) and self.final_projection[0].in_features != concatenated_dim:
-            self.final_projection = nn.Sequential(
-                nn.Linear(concatenated_dim, self.output_dim),
-                nn.GELU(),
-                nn.Linear(self.output_dim, self.output_dim)
-            ).to(device)
-        
-        return self.final_projection(concatenated_contexts)
-
-
 class ContextUnet(nn.Module):
-    def __init__(self, in_channels, n_feat=256, n_classes=6, use_variable_context=True):
+    def __init__(self, in_channels, n_feat = 256, n_classes=3):
         super(ContextUnet, self).__init__()
 
         self.in_channels = in_channels
         self.n_feat = n_feat
         self.n_classes = n_classes
-        self.use_variable_context = use_variable_context
 
         self.init_conv = ResidualConvBlock(in_channels, n_feat, is_res=True)
 
         self.down1 = UnetDown(n_feat, n_feat)
         self.down2 = UnetDown(n_feat, 2 * n_feat)
 
+        # Adjust AvgPool2d to match input feature map size
         self.to_vec = nn.Sequential(nn.AvgPool2d((1, 8)), nn.GELU())
 
-        self.timeembed1 = EmbedFC(1, 2 * n_feat)
-        self.timeembed2 = EmbedFC(1, 1 * n_feat)
+        self.timeembed1 = EmbedFC(1, 2*n_feat)
+        self.timeembed2 = EmbedFC(1, 1*n_feat)
+        self.contextembed1 = EmbedFC(n_classes, 2*n_feat)
+        self.contextembed2 = EmbedFC(n_classes, 1*n_feat)
 
-        # Embedder for fixed context or the first element of variable context
-        # The first context (user location) is 3-dimensional
-        self.contextembed1 = EmbedFC(3, 2 * n_feat)
-        self.contextembed2 = EmbedFC(3, 1 * n_feat)
+        # Embedding for the 3D coordinates
+        self.coord_dim = 3
+        self.coord_embed = nn.Linear(self.coord_dim, n_feat)
         
-        if use_variable_context:
-            self.context_processor = SimpleContextProcessor(output_dim=2 * n_feat, first_element_embedder=self.contextembed1)
-            self.context_processor2 = SimpleContextProcessor(output_dim=1 * n_feat, first_element_embedder=self.contextembed2)
-        else:
-            # For clarity, set processors to None when not used
-            self.context_processor = None
-            self.context_processor2 = None
-
         self.up0 = nn.Sequential(
             nn.ConvTranspose2d(2 * n_feat, 2 * n_feat, kernel_size=(1, 8), stride=(1, 8)),
             nn.GroupNorm(8, 2 * n_feat),
@@ -238,30 +167,12 @@ class ContextUnet(nn.Module):
         down2 = self.down2(down1)
         hiddenvec = self.to_vec(down2)
 
-        # embed time step
+        # embed context, time step
+        c = c.float()
+        cemb1 = self.contextembed1(c).view(-1, self.n_feat * 2, 1, 1)
         temb1 = self.timeembed1(t).view(-1, self.n_feat * 2, 1, 1)
+        cemb2 = self.contextembed2(c).view(-1, self.n_feat, 1, 1)
         temb2 = self.timeembed2(t).view(-1, self.n_feat, 1, 1)
-
-        # Process context based on type
-        if self.use_variable_context:
-            # c is expected to be a list of tuples with varying dimensions
-            # e.g., [(x_coords, y_coords, z_coords), (los_status,), (antenna_count, freq, power)]
-            if isinstance(c, torch.Tensor) and c.ndim == 2 and c.shape[1] == 9:
-                # Split 9D context into 5 groups: [x, y, z, bs_ant_h, bs_ant_v, ue_ant_h, ue_ant_v, bs_spacing, ue_spacing]
-                # Group 1: [x, y, z] - user location (3D)
-                # Group 2: [bs_ant_h, bs_ant_v] - BS antenna config (2D)
-                # Group 3: [ue_ant_h, ue_ant_v] - UE antenna config (2D)
-                # Group 4: [bs_spacing] - BS spacing (1D)
-                # Group 5: [ue_spacing] - UE spacing (1D)
-                c = [c[:, :3], c[:, 3:5], c[:, 5:7], c[:, 7:8], c[:, 8:9]]
-            
-            cemb1 = self.context_processor(c).view(-1, self.n_feat * 2, 1, 1)
-            cemb2 = self.context_processor2(c).view(-1, self.n_feat, 1, 1)
-        else:
-            # Original fixed-size context processing
-            c = c.float()
-            cemb1 = self.contextembed1(c).view(-1, self.n_feat * 2, 1, 1)
-            cemb2 = self.contextembed2(c).view(-1, self.n_feat, 1, 1)
 
         # Combine embeddings with upsampling
         up1 = self.up0(hiddenvec)
@@ -377,7 +288,7 @@ class DDIM(nn.Module):
         return x_i, x_i_store
 
 class BerUMaLDataset(Dataset):
-    def __init__(self, dataset_folder="../datasets/DeepMIMO_dataset", idx_start=0, idx_end=None, use_deepmimo=True):
+    def __init__(self, dataset_folder="DeepMIMO_dataset", idx_start=0, idx_end=None, use_deepmimo=True):
         self.dataset_folder = dataset_folder
         self.idx_start = idx_start
         self.idx_end = idx_end
@@ -395,15 +306,14 @@ class BerUMaLDataset(Dataset):
         # Import our DeepMIMO loader
         import sys
         import os
-        sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+        #sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
         from load_deepmimo_datasets import load_deepmimo_datasets, create_ml_dataset
         
         # Load all DeepMIMO datasets
         print("Loading DeepMIMO datasets...")
         # Use absolute path to ensure we find the dataset folder
-        #dataset_path = os.path.join(os.path.dirname(__file__), '..', self.dataset_folder)
         dataset_path = os.path.join(self.dataset_folder)
-        data = load_deepmimo_datasets(dataset_path, verbose=True)
+        data = load_deepmimo_datasets(dataset_path, verbose=False)
         
         # Create ML-ready dataset
         X, y, metadata = create_ml_dataset(data, include_metadata=True)
@@ -436,12 +346,14 @@ class BerUMaLDataset(Dataset):
                 ue_ant_v = meta.get('ue_ant_v', 2)
                 
                 # Reshape to (num_ant_BS, num_ant_UE) format
-                channel_2d = X[i].reshape(ue_ant_h * ue_ant_v, bs_ant_h * bs_ant_v )
+                channel_2d = X[i].reshape( ue_ant_h * ue_ant_v, bs_ant_h * bs_ant_v)
+                
+                print(channel_2d.shape)
                 
                 # Convert to complex and then to real/imaginary parts
                 # For now, we'll use the real part as channel data
                 # You may need to adjust this based on your specific channel representation
-                channel_complex = channel_2d  # Assuming X[i] is already complex
+                channel_complex =  channel_2d  # Assuming X[i] is already complex
                 
                 # Stack real and imaginary parts
                 array1 = np.stack((np.real(channel_complex), np.imag(channel_complex)), axis=0)
@@ -461,37 +373,22 @@ class BerUMaLDataset(Dataset):
                 
                 self.data.append(array1[:2, :, :])
                 
-                # Create combined label with user location, antenna configuration, and spacing
+                # Use user location as label (rx_positions equivalent)
                 if 'user_location' in meta and meta['user_location'] is not None:
-                    # Flatten user location and combine with other parameters
-                    location = meta['user_location'].flatten() if hasattr(meta['user_location'], 'flatten') else meta['user_location']
-                    
-                    # Get additional parameters and ensure they are scalars
-                    bs_spacing = float(meta.get('bs_spacing', 0.5))  # Default spacing
-                    ue_spacing = float(meta.get('ue_spacing', 0.5))  # Default spacing
-                    
-                    # Combine: [x, y, z, bs_ant_h, bs_ant_v, ue_ant_h, ue_ant_v, bs_spacing, ue_spacing]
-                    combined_label = np.concatenate([
-                        location, 
-                        [bs_ant_h, bs_ant_v, ue_ant_h, ue_ant_v],
-                        [bs_spacing, ue_spacing]
-                    ])
-                    self.labels.append(combined_label)
+                    self.labels.append(meta['user_location'])
                 else:
-                    # Fallback to default values
-                    # Use default location [0, 0, 0] + antenna config + default spacing
-                    self.labels.append(np.array([0, 0, 0, bs_ant_h, bs_ant_v, ue_ant_h, ue_ant_v, 0.5, 0.5]))
+                    # Fallback to antenna configuration as label
+                    self.labels.append([bs_ant_h, bs_ant_v, ue_ant_h, ue_ant_v])
             else:
                 # Fallback for missing metadata
                 channel_2d = X[i].reshape(8, 4)  # Default shape
                 array1 = np.stack((np.real(channel_2d), np.imag(channel_2d)), axis=0)
                 self.data.append(array1[:2, :, :])
-                # Use default values for combined label: [0, 0, 0, 8, 4, 2, 2, 0.5, 0.5]
-                self.labels.append(np.array([0, 0, 0, 8, 4, 2, 2, 0.5, 0.5]))  # Default location + antenna config + spacing
+                self.labels.append([8, 4, 2, 2])  # Default antenna config
     
     def load_original_dataset(self):
         """Load original BerUMaL dataset format"""
-        contents = scipy.io.loadmat(self.data_path)
+        contents = scipy.io.loadmat(self.dataset_folder)
         array1 = contents['H_set'][self.idx_start:self.idx_end,:,:] # (10000, 4, 32)
         array1 = np.stack((np.real(array1[:,:,:]), np.imag(array1[:,:,:])), axis=1)
         array2 = array1.copy()
@@ -541,22 +438,18 @@ def tensor_to_pil(tensor, scale_factor=5, border_size=1, border_color=(0, 0, 0))
     return new_image
 
 def train():
-    n_epoch = 5000 #50000
+    n_epoch = 5000
     batch_size = 128
     n_T = 256
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    n_classes = 9  # Updated to match our combined label format: [x, y, z, bs_ant_h, bs_ant_v, ue_ant_h, ue_ant_v, bs_spacing, ue_spacing]
+    n_classes = 3
     n_feat = 256
     lrate = 1e-4
-    save_model = True
+    save_model = False
 
-    num_samples = 160000 # 1000 #10000
-
-    # save_dir = f'../../outputs/esh_ddim/cDDIM_{num_samples}/'
-
-    save_dir = f'./data/batch_job_cDDIM_{num_samples}/'
-    os.makedirs(save_dir, exist_ok=True)
-
+    num_samples = 10000
+    save_dir = f'./data/cDDIM_original_comparison_{num_samples}/'
+    os.makedirs(save_dir,exist_ok=True)
     ws_test = [0.0] # strength of generative guidance
     n_sample = 10
 
@@ -575,28 +468,25 @@ def train():
     if use_deepmimo:
         # Use DeepMIMO dataset
         berumal_dataset_train = BerUMaLDataset("../../datasets/DeepMIMO_dataset_full", 0, num_samples, use_deepmimo=True)
-        berumal_dataset_test = BerUMaLDataset("../../datasets/DeepMIMO_dataset_full", num_samples, num_samples + 20000, use_deepmimo=True)
+        berumal_dataset_test = BerUMaLDataset("../../datasets/DeepMIMO_dataset_full", num_samples, num_samples + 1000, use_deepmimo=True)
     else:
         # Use original BerUMaL dataset
         berumal_dataset_train = BerUMaLDataset("./data/QuaDRiGa/NumUEs_100000_num_BerUMaL_ULA.mat", 0, num_samples, use_deepmimo=False)
         berumal_dataset_test = BerUMaLDataset("./data/QuaDRiGa/NumUEs_100000_num_BerUMaL_ULA.mat", 90000, 100000, use_deepmimo=False)
 
     # Create a DataLoader for the BerUMaL dataset
-    print(berumal_dataset_train.labels)
     dataloader_train = DataLoader(berumal_dataset_train, batch_size=batch_size, shuffle=True)
-    data_labels = dataloader_train.dataset.labels
-    #print(data_labels[10])
     dataloader_test = DataLoader(berumal_dataset_test, batch_size=batch_size, shuffle=False)
 
     # Select a fixed subset of test samples and their corresponding coordinates\
-    # fixed_test_samples, fixed_test_coords = next(iter(dataloader_test))
-    # fixed_test_samples = fixed_test_samples[:n_sample].to(device)
-    # fixed_test_coords = fixed_test_coords[:n_sample].to(device)
+    fixed_test_samples, fixed_test_coords = next(iter(dataloader_test))
+    fixed_test_samples = fixed_test_samples[:n_sample].to(device)
+    fixed_test_coords = fixed_test_coords[:n_sample].to(device)
 
     optim = torch.optim.Adam(ddim.parameters(), lr=lrate)
 
     nmse_values_test = []  # List to store NMSE values
-    os.makedirs(save_dir, exist_ok=True)
+
     epoch_pbar = tqdm(range(n_epoch), desc="Training Progress")
     for ep in tqdm(range(n_epoch)):
         
@@ -627,56 +517,5 @@ def train():
             torch.save(ddim.state_dict(), save_dir + f"model_{ep}.pth")
             print('saved model at ' + save_dir + f"model_{ep}.pth")
 
-def demo_variable_context():
-    """
-    Demonstration of how to use the new variable context functionality.
-    Shows how to create and use sequences of tuples with varying dimensions.
-    """
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    
-    # Create model with variable context enabled
-    model = ContextUnet(
-        in_channels=2, 
-        n_feat=256, 
-        n_classes=3, 
-        use_variable_context=True
-    ).to(device)
-    
-    # Example input data
-    batch_size = 4
-    x = torch.randn(batch_size, 2, 4, 32).to(device)  # Channel data
-    t = torch.rand(batch_size, 1, 1, 1).to(device)    # Time step
-    context_mask = torch.zeros(batch_size, 1).to(device)
-    
-    # Example variable context: sequence of tuples with different dimensions
-    # Each tuple represents different types of context information
-    context_sequence = [
-        # Tuple 1: 3D coordinates (x, y, z)
-        (torch.randn(batch_size, 1).to(device),  # x coordinate
-         torch.randn(batch_size, 1).to(device),  # y coordinate  
-         torch.randn(batch_size, 1).to(device)), # z coordinate
-        
-        # Tuple 2: Line-of-sight status (binary)
-        (torch.randint(0, 2, (batch_size, 1)).float().to(device),),  # LOS/NLOS status
-        
-        # Tuple 3: Hardware parameters (antenna count, frequency, power)
-        (torch.randint(1, 17, (batch_size, 1)).float().to(device),   # antenna count
-         torch.randn(batch_size, 1).to(device),                      # frequency
-         torch.randn(batch_size, 1).to(device))                      # power
-    ]
-    
-    print("Variable Context Example:")
-    print(f"Context sequence length: {len(context_sequence)}")
-    for i, ctx_tuple in enumerate(context_sequence):
-        print(f"  Tuple {i+1}: {[tensor.shape for tensor in ctx_tuple]}")
-    
-    # Forward pass
-    with torch.no_grad():
-        output = model(x, context_sequence, t, context_mask)
-        print(f"Model output shape: {output.shape}")
-        print("✓ Variable context processing successful!")
-
-
 if __name__ == "__main__":
     train()
-    #demo_variable_context()

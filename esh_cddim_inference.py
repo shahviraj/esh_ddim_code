@@ -58,6 +58,11 @@ class ESHcDDIMInference:
         self.device = device
         self.model_path = model_path
         
+        # Create unique results directory based on model name
+        self.model_name = self._extract_model_name(model_path)
+        self.results_dir = f"./results/esh_cddim_inference_{self.model_name}"
+        os.makedirs(self.results_dir, exist_ok=True)
+        
         # Model parameters (should match training configuration)
         self.n_feat = 256
         self.n_classes = 9  # [x, y, z, bs_ant_h, bs_ant_v, ue_ant_h, ue_ant_v, bs_spacing, ue_spacing]
@@ -82,12 +87,67 @@ class ESHcDDIMInference:
         
         # Load trained model
         self.load_model()
+    
+    def _extract_model_name(self, model_path: str) -> str:
+        """
+        Extract a unique model name from the model path for creating unique result directories.
+        
+        Parameters:
+        - model_path: Path to the model file
+        
+        Returns:
+        - Unique model name string
+        """
+        # Get the filename without extension
+        model_filename = os.path.basename(model_path)
+        model_name = os.path.splitext(model_filename)[0]
+        
+        # If it's just 'model', try to get parent directory name
+        #if model_name == 'model':
+        parent_dir = os.path.basename(os.path.dirname(model_path))
+        if parent_dir:
+            model_name = parent_dir + '_' + model_name
+        else:
+            # Fallback to timestamp if no meaningful name found
+            import time
+            model_name = f"model_{int(time.time())}"
+        
+        # Clean the name for filesystem compatibility
+        model_name = model_name.replace('/', '_').replace('\\', '_').replace(' ', '_')
+        
+        return model_name
         
     def load_model(self):
         """Load the trained model weights."""
         try:
+            # Prime dynamic context processors to materialize submodules created during training
+            # This ensures keys like context_processor.final_projection and context_embedders exist
+            self.model.to(self.device)
+            with torch.no_grad():
+                batch_size = 1
+                # Construct the same 5-tuple variable context used in training: [3], [2], [2], [1], [1]
+                ctx_seq = [
+                    torch.zeros(batch_size, 3, device=self.device, dtype=torch.float32),
+                    torch.zeros(batch_size, 2, device=self.device, dtype=torch.float32),
+                    torch.zeros(batch_size, 2, device=self.device, dtype=torch.float32),
+                    torch.zeros(batch_size, 1, device=self.device, dtype=torch.float32),
+                    torch.zeros(batch_size, 1, device=self.device, dtype=torch.float32),
+                ]
+                # Run through processors to instantiate dynamic layers
+                _ = self.model.context_processor(ctx_seq)
+                _ = self.model.context_processor2(ctx_seq)
+
             checkpoint = torch.load(self.model_path, map_location=self.device)
-            self.ddim.load_state_dict(checkpoint)
+            try:
+                self.ddim.load_state_dict(checkpoint, strict=True)
+            except Exception as e:
+                print(f"Warning: strict load failed ({e}). Falling back to non-strict load.")
+                missing, unexpected = self.ddim.load_state_dict(checkpoint, strict=False)
+                if missing:
+                    print(f"  Missing keys: {len(missing)} (showing first 10): {missing[:10]}")
+                if unexpected:
+                    print(f"  Unexpected keys: {len(unexpected)} (showing first 10): {unexpected[:10]}")
+
             self.ddim.to(self.device)
             self.ddim.eval()
             print(f"✓ Model loaded successfully from {self.model_path}")
@@ -132,6 +192,9 @@ class ESHcDDIMInference:
         
         # Save if path provided
         if save_path:
+            # If save_path is relative, make it relative to the unique results directory
+            if not os.path.isabs(save_path):
+                save_path = os.path.join(self.results_dir, save_path)
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             savemat(save_path, {'H_generated': generated_channels.cpu().numpy()})
             np.save(save_path.replace('.mat', '.npy'), generated_channels.cpu().numpy())
@@ -207,6 +270,7 @@ class ESHcDDIMInference:
         metrics['Rank_Correlation'] = np.corrcoef(ref_rank, gen_rank)[0, 1]
         
         # 5. Statistical properties
+        gen_np = np.transpose(gen_np, (0, 3, 1, 2))
         metrics['Mean_Magnitude_Error'] = np.mean(np.abs(np.abs(ref_np) - np.abs(gen_np)))
         metrics['Std_Magnitude_Error'] = np.std(np.abs(np.abs(ref_np) - np.abs(gen_np)))
         
@@ -266,6 +330,10 @@ class ESHcDDIMInference:
         plt.tight_layout()
         
         if save_path:
+            # If save_path is relative, make it relative to the unique results directory
+            if not os.path.isabs(save_path):
+                save_path = os.path.join(self.results_dir, save_path)
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
             print(f"✓ Visualization saved to {save_path}")
         
@@ -346,6 +414,10 @@ class ESHcDDIMInference:
         plt.tight_layout()
         
         if save_path:
+            # If save_path is relative, make it relative to the unique results directory
+            if not os.path.isabs(save_path):
+                save_path = os.path.join(self.results_dir, save_path)
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
             print(f"✓ Hardware awareness analysis saved to {save_path}")
         
@@ -387,7 +459,7 @@ def create_test_context_vectors(n_samples: int = 100,
     
     return context_vectors
 
-def load_reference_data(dataset_path: str = "DeepMIMO_dataset", 
+def load_reference_data(dataset_path: str = "../../datasets/DeepMIMO_dataset_full", 
                        n_samples: int = 100) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Load reference data for evaluation.
@@ -426,15 +498,14 @@ def main():
     mode = sys.argv[1]
     
     # Configuration
-    model_path = "./data/cDDIM_10/model.pth"  # Update this path
+    model_path = "./data/cDDIM_10000/model_2000.pth"  # Update this path
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     n_samples = 50
-    save_dir = "./results/esh_cddim_inference"
-    os.makedirs(save_dir, exist_ok=True)
     
-    # Initialize inference class
+    # Initialize inference class (this will create unique results directory)
     try:
         inference = ESHcDDIMInference(model_path, device)
+        print(f"Results will be saved to: {inference.results_dir}")
     except Exception as e:
         print(f"Failed to initialize inference: {e}")
         return
@@ -450,14 +521,14 @@ def main():
             context_vectors=context_vectors,
             n_samples=n_samples,
             guidance_scale=0.0,
-            save_path=os.path.join(save_dir, "generated_channels.mat")
+            save_path="generated_channels.mat"
         )
         
         # Visualize some samples
         inference.visualize_channels(
             channels=generated_channels[:4],
             context_vectors=context_vectors[:4],
-            save_path=os.path.join(save_dir, "generated_channels_visualization.png")
+            save_path="generated_channels_visualization.png"
         )
         
     elif mode == "evaluate":
@@ -485,9 +556,11 @@ def main():
         )
         
         # Save evaluation results
-        with open(os.path.join(save_dir, "evaluation_metrics.txt"), "w") as f:
+        eval_metrics_path = os.path.join(inference.results_dir, "evaluation_metrics.txt")
+        with open(eval_metrics_path, "w") as f:
             for metric, value in metrics.items():
                 f.write(f"{metric}: {value:.6f}\n")
+        print(f"✓ Evaluation metrics saved to {eval_metrics_path}")
         
     elif mode == "visualize":
         print("=== Visualizing Channel Characteristics ===")
@@ -506,7 +579,7 @@ def main():
         inference.visualize_channels(
             channels=generated_channels,
             context_vectors=context_vectors,
-            save_path=os.path.join(save_dir, "channel_visualization.png")
+            save_path="channel_visualization.png"
         )
         
     elif mode == "hardware":
@@ -528,11 +601,13 @@ def main():
         results = inference.analyze_hardware_awareness(
             base_context=base_context,
             hardware_variations=hardware_variations,
-            save_path=os.path.join(save_dir, "hardware_awareness_analysis.png")
+            save_path="hardware_awareness_analysis.png"
         )
         
         # Save results
-        np.save(os.path.join(save_dir, "hardware_analysis_results.npy"), results)
+        results_path = os.path.join(inference.results_dir, "hardware_analysis_results.npy")
+        np.save(results_path, results)
+        print(f"✓ Hardware analysis results saved to {results_path}")
         
     else:
         print(f"Unknown mode: {mode}")
