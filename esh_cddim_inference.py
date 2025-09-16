@@ -86,8 +86,34 @@ class ESHcDDIMInference:
     def load_model(self):
         """Load the trained model weights."""
         try:
+            # Prime dynamic context processors to materialize submodules created during training
+            # This ensures keys like context_processor.final_projection and context_embedders exist
+            self.model.to(self.device)
+            with torch.no_grad():
+                batch_size = 1
+                # Construct the same 5-tuple variable context used in training: [3], [2], [2], [1], [1]
+                ctx_seq = [
+                    torch.zeros(batch_size, 3, device=self.device, dtype=torch.float32),
+                    torch.zeros(batch_size, 2, device=self.device, dtype=torch.float32),
+                    torch.zeros(batch_size, 2, device=self.device, dtype=torch.float32),
+                    torch.zeros(batch_size, 1, device=self.device, dtype=torch.float32),
+                    torch.zeros(batch_size, 1, device=self.device, dtype=torch.float32),
+                ]
+                # Run through processors to instantiate dynamic layers
+                _ = self.model.context_processor(ctx_seq)
+                _ = self.model.context_processor2(ctx_seq)
+
             checkpoint = torch.load(self.model_path, map_location=self.device)
-            self.ddim.load_state_dict(checkpoint)
+            try:
+                self.ddim.load_state_dict(checkpoint, strict=True)
+            except Exception as e:
+                print(f"Warning: strict load failed ({e}). Falling back to non-strict load.")
+                missing, unexpected = self.ddim.load_state_dict(checkpoint, strict=False)
+                if missing:
+                    print(f"  Missing keys: {len(missing)} (showing first 10): {missing[:10]}")
+                if unexpected:
+                    print(f"  Unexpected keys: {len(unexpected)} (showing first 10): {unexpected[:10]}")
+
             self.ddim.to(self.device)
             self.ddim.eval()
             print(f"✓ Model loaded successfully from {self.model_path}")
