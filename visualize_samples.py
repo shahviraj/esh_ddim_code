@@ -91,7 +91,7 @@ def generate_comparison_figure(esh_inference, cddim_inference, dataset_path, sav
         
         # Store results
         results['configs'].append(config)
-        results['gt_channels'].append(gt_channel.cpu().numpy())
+        results['gt_channels'].append(np.transpose(gt_channel.cpu().numpy(), (0, 2,3, 1)))
         results['cddim_channels'].append(cddim_channel.cpu().numpy())
         results['hcddim_channels'].append(hcddim_channel.cpu().numpy())
 
