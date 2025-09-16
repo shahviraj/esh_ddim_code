@@ -225,19 +225,19 @@ def run_hardware_specific_fidelity_test(esh_inference, cddim_inference, dataset_
     print(f"✓ Fidelity comparison results saved to {results_path}")
 
 
-def run_cross_hardware_test(esh_inference, cddim_inference, dataset_path, save_dir):
+def run_cross_hardware_test(esh_inference, cddim_inference, dataset_path, save_dir, n_avg_samples=50):
     """
     Visually demonstrates that ESH-cDDIM produces different channels for different
-    hardware configs at the same location, while cDDIM does not.
+    hardware configs at the same location, while cDDIM does not, comparing against
+    the average of ground truth samples.
     """
     print("\n=== Running Cross-Hardware Generation Test ===")
 
-    # 1. Load data and find a location with at least two different hardware configs
-    print("Searching for a suitable test location with multiple hardware configurations...")
+    # 1. Load data and find two different hardware configs
+    print("Searching for suitable hardware configurations...")
     data = load_deepmimo_datasets(dataset_path, verbose=False)
     _, _, metadata = create_ml_dataset(data)
 
-    # Find two different, compatible hardware configurations from the metadata
     configs = []
     for m in metadata:
         if (m['bs_ant_h'] * m['bs_ant_v'] == 32) and (m['ue_ant_h'] * m['ue_ant_v'] == 4):
@@ -251,79 +251,71 @@ def run_cross_hardware_test(esh_inference, cddim_inference, dataset_path, save_d
 
     config_a_tuple, config_b_tuple = configs[0], configs[1]
     
-    # Find a user location that exists for both configurations (if possible)
-    # For simplicity, we'll just use the first user from each config
-    
     def get_full_config(cfg_tuple):
         return {'bs_ant_h': cfg_tuple[0], 'bs_ant_v': cfg_tuple[1], 'ue_ant_h': cfg_tuple[2], 'ue_ant_v': cfg_tuple[3], 'bs_spacing': cfg_tuple[4], 'ue_spacing': cfg_tuple[5]}
 
     config_a = get_full_config(config_a_tuple)
     config_b = get_full_config(config_b_tuple)
 
-    # Find a sample for each configuration
+    # Pick a single location for generation, e.g., from the first config sample
     meta_a = next((m for m in metadata if (m['bs_ant_h'], m['bs_ant_v'], m['ue_ant_h'], m['ue_ant_v'], m['bs_spacing'], m['ue_spacing']) == config_a_tuple), None)
-    meta_b = next((m for m in metadata if (m['bs_ant_h'], m['bs_ant_v'], m['ue_ant_h'], m['ue_ant_v'], m['bs_spacing'], m['ue_spacing']) == config_b_tuple), None)
-    
-    if not meta_a or not meta_b:
-        print("Error: Could not find samples for both selected configurations.")
-        return
-    
-    # Get the indices to load the ground truth channels
-    index_a = metadata.index(meta_a)
-    index_b = metadata.index(meta_b)
-
-    # Load the ground truth channels
-    gt_channel_a, _ = load_reference_data(dataset_path, indices=[index_a])
-    gt_channel_b, _ = load_reference_data(dataset_path, indices=[index_b])
-    gt_channel_a, gt_channel_b = gt_channel_a[0], gt_channel_b[0]
-
-    # Use the same location for both tests
     test_location = meta_a['user_location']
-    print(f"Using test location: {test_location}")
+
+    print(f"Using test location: {test_location.flatten()}")
     print(f"Config A: {config_a}")
     print(f"Config B: {config_b}")
 
-    # 2. Prepare conditioning vectors
-    esh_cond_a = torch.tensor([list(test_location.flatten()) + list(config_a_tuple)]).float()
-    esh_cond_b = torch.tensor([list(test_location.flatten()) + list(config_b_tuple)]).float()
-    cddim_cond = torch.tensor([test_location.flatten()]).float()
+    # 2. Prepare conditioning vectors (repeated for averaging)
+    esh_cond_a = torch.tensor([list(test_location.flatten()) + list(config_a_tuple)] * n_avg_samples).float()
+    esh_cond_b = torch.tensor([list(test_location.flatten()) + list(config_b_tuple)] * n_avg_samples).float()
+    cddim_cond = torch.tensor([test_location.flatten()] * n_avg_samples).float()
 
-    # 3. Generate channels
-    print("Generating channels for cross-hardware comparison...")
-    esh_gen_a = esh_inference.generate_channels(esh_cond_a, n_samples=1)[0]
-    esh_gen_b = esh_inference.generate_channels(esh_cond_b, n_samples=1)[0]
-    cddim_gen = cddim_inference.generate_channels(cddim_cond, n_samples=1)[0]
+    # 3. Generate n_avg_samples for each model/config
+    print(f"Generating {n_avg_samples} samples for each condition for averaging...")
+    esh_gen_a = esh_inference.generate_channels(esh_cond_a, n_samples=n_avg_samples)
+    esh_gen_b = esh_inference.generate_channels(esh_cond_b, n_samples=n_avg_samples)
+    cddim_gen = cddim_inference.generate_channels(cddim_cond, n_samples=n_avg_samples)
+
+    # 4. Load all ground truth channels for each config
+    indices_a = [i for i, m in enumerate(metadata) if (m['bs_ant_h'], m['bs_ant_v'], m['ue_ant_h'], m['ue_ant_v'], m['bs_spacing'], m['ue_spacing']) == config_a_tuple]
+    indices_b = [i for i, m in enumerate(metadata) if (m['bs_ant_h'], m['bs_ant_v'], m['ue_ant_h'], m['ue_ant_v'], m['bs_spacing'], m['ue_spacing']) == config_b_tuple]
     
-    # 4. Analyze and Plot Singular Values
-    esh_stats_a = esh_inference.calculate_channel_statistics(esh_gen_a.unsqueeze(0))
-    esh_stats_b = esh_inference.calculate_channel_statistics(esh_gen_b.unsqueeze(0))
-    cddim_stats = esh_inference.calculate_channel_statistics(cddim_gen.unsqueeze(0))
-    gt_stats_a = esh_inference.calculate_channel_statistics(gt_channel_a.unsqueeze(0))
-    gt_stats_b = esh_inference.calculate_channel_statistics(gt_channel_b.unsqueeze(0))
+    gt_channels_a, _ = load_reference_data(dataset_path, indices=indices_a)
+    gt_channels_b, _ = load_reference_data(dataset_path, indices=indices_b)
+    
+    # 5. Calculate and average singular values
+    def get_avg_singular_values(channels):
+        stats = esh_inference.calculate_channel_statistics(channels)
+        # Pad singular values to the same length for averaging
+        max_len = max(len(s) for s in stats['singular_values'])
+        padded_sv = [np.pad(s, (0, max_len - len(s))) for s in stats['singular_values']]
+        return np.mean(padded_sv, axis=0)
 
+    avg_sv_esh_a = get_avg_singular_values(esh_gen_a)
+    avg_sv_esh_b = get_avg_singular_values(esh_gen_b)
+    avg_sv_cddim = get_avg_singular_values(cddim_gen)
+    avg_sv_gt_a = get_avg_singular_values(gt_channels_a)
+    avg_sv_gt_b = get_avg_singular_values(gt_channels_b)
+
+    # 6. Plot the averaged singular value curves
     plt.figure(figsize=(12, 8))
-    # Plot Config A
-    plt.plot(gt_stats_a['singular_values'][0], 'o-', label=f'Ground Truth (Config A)', color='blue', markersize=8)
-    plt.plot(esh_stats_a['singular_values'][0], 's--', label=f'ESH-cDDIM (Config A)', color='green', markersize=6)
+    plt.plot(avg_sv_gt_a, 'o-', label=f'Ground Truth (Config A)', color='blue', markersize=8)
+    plt.plot(avg_sv_esh_a, 's--', label=f'ESH-cDDIM (Config A)', color='green', markersize=6)
+    plt.plot(avg_sv_gt_b, 'o-', label=f'Ground Truth (Config B)', color='orange', markersize=8)
+    plt.plot(avg_sv_esh_b, 's--', label=f'ESH-cDDIM (Config B)', color='purple', markersize=6)
+    plt.plot(avg_sv_cddim, 'x-.', label='Baseline cDDIM (Hardware-Agnostic)', color='red', markersize=8)
     
-    # Plot Config B
-    plt.plot(gt_stats_b['singular_values'][0], 'o-', label=f'Ground Truth (Config B)', color='orange', markersize=8)
-    plt.plot(esh_stats_b['singular_values'][0], 's--', label=f'ESH-cDDIM (Config B)', color='purple', markersize=6)
-    
-    # Plot Baseline
-    plt.plot(cddim_stats['singular_values'][0], 'x-.', label='Baseline cDDIM (Hardware-Agnostic)', color='red', markersize=8)
-    
-    plt.title('Singular Value Distribution for Different Hardware Configurations', fontsize=16)
+    plt.title('Average Singular Value Distribution for Different Hardware Configurations', fontsize=16)
     plt.xlabel('Singular Value Index', fontsize=12)
-    plt.ylabel('Singular Value Magnitude', fontsize=12)
+    plt.ylabel('Average Singular Value Magnitude', fontsize=12)
     plt.yscale('log')
     plt.legend(fontsize=10)
     plt.grid(True, which="both", ls="--")
     
-    save_path = os.path.join(save_dir, 'comparison_cross_hardware_test.png')
+    save_path = os.path.join(save_dir, 'comparison_cross_hardware_test_averaged.png')
     plt.savefig(save_path, dpi=300)
     plt.show()
-    print(f"✓ Cross-hardware comparison plot saved to {save_path}")
+    print(f"✓ Averaged cross-hardware comparison plot saved to {save_path}")
 
 
 def main():
@@ -333,6 +325,7 @@ def main():
     parser.add_argument('--dataset_path', type=str, default="../../datasets/DeepMIMO_dataset_full", help='Path to the DeepMIMO test dataset')
     parser.add_argument('--mode', type=str, default='all', choices=['all', 'fidelity', 'cross_hardware'], help='Comparison mode to run')
     parser.add_argument('--save_dir', type=str, default='./results/comparison', help='Directory to save comparison results')
+    parser.add_argument('--n_avg_samples', type=int, default=50, help='Number of samples to generate for averaging in cross-hardware test')
     args = parser.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
@@ -345,7 +338,7 @@ def main():
         run_hardware_specific_fidelity_test(esh_inference, cddim_inference, args.dataset_path, args.save_dir)
     
     if args.mode in ['all', 'cross_hardware']:
-        run_cross_hardware_test(esh_inference, cddim_inference, args.dataset_path, args.save_dir)
+        run_cross_hardware_test(esh_inference, cddim_inference, args.dataset_path, args.save_dir, n_avg_samples=args.n_avg_samples)
 
     print("\n✓ Comparison evaluation finished.")
 
