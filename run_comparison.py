@@ -29,7 +29,31 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '.')))
 from esh_cddim_inference import ESHcDDIMInference, load_reference_data
 from cddim_comparison_train import ContextUnet as cDDIM_ContextUnet, DDIM as cDDIM_DDIM
 from load_deepmimo_datasets import load_deepmimo_datasets, create_ml_dataset
-from scipy.stats import wasserstein_distance
+from scipy.stats import wasserstein_distance, ks_2samp
+from sklearn.metrics.pairwise import rbf_kernel
+
+
+def calculate_mmd(x, y, sigma=None):
+    """Calculates the Maximum Mean Discrepancy (MMD) between two samples."""
+    # Reshape for kernel function
+    x = x.reshape(-1, 1)
+    y = y.reshape(-1, 1)
+    
+    # Heuristic for sigma: median pairwise distance
+    if sigma is None:
+        all_samples = np.vstack([x, y])
+        distances = np.median(np.abs(all_samples - np.median(all_samples)))
+        sigma = distances if distances > 0 else 1.0
+
+    # Calculate kernel matrices
+    gamma = 1.0 / (2 * sigma**2)
+    k_xx = rbf_kernel(x, x, gamma=gamma)
+    k_yy = rbf_kernel(y, y, gamma=gamma)
+    k_xy = rbf_kernel(x, y, gamma=gamma)
+    
+    # Calculate MMD^2
+    mmd2 = k_xx.mean() + k_yy.mean() - 2 * k_xy.mean()
+    return np.sqrt(mmd2) if mmd2 > 0 else 0
 
 
 class cDDIMInference:
@@ -201,13 +225,34 @@ def run_hardware_specific_fidelity_test(esh_inference, cddim_inference, dataset_
         results[f'w_dist_{metric}_esh'] = w_dist_esh
         results[f'w_dist_{metric}_cddim'] = w_dist_cddim
 
-        print(f"  Wasserstein Distance for '{metric}':")
-        print(f"    - ESH-cDDIM: {w_dist_esh:.4f}")
-        print(f"    - cDDIM:     {w_dist_cddim:.4f}")
+        # Calculate MMD
+        mmd_esh = calculate_mmd(gt_stats[metric], esh_stats[metric])
+        mmd_cddim = calculate_mmd(gt_stats[metric], cddim_stats[metric])
+        results[f'mmd_{metric}_esh'] = mmd_esh
+        results[f'mmd_{metric}_cddim'] = mmd_cddim
+
+        # Calculate KS Statistic
+        ks_esh = ks_2samp(gt_stats[metric], esh_stats[metric])
+        ks_cddim = ks_2samp(gt_stats[metric], cddim_stats[metric])
+        results[f'ks_stat_{metric}_esh'] = ks_esh.statistic
+        results[f'ks_pvalue_{metric}_esh'] = ks_esh.pvalue
+        results[f'ks_stat_{metric}_cddim'] = ks_cddim.statistic
+        results[f'ks_pvalue_{metric}_cddim'] = ks_cddim.pvalue
+
+        print(f"\n--- Metrics for {metric.replace('_', ' ').title()} ---")
+        print(f"  Wasserstein Distance:")
+        print(f"    - H-cDDIM: {w_dist_esh:.4f}")
+        print(f"    - cDDIM:   {w_dist_cddim:.4f}")
+        print(f"  Maximum Mean Discrepancy (MMD):")
+        print(f"    - H-cDDIM: {mmd_esh:.4f}")
+        print(f"    - cDDIM:   {mmd_cddim:.4f}")
+        print(f"  Kolmogorov-Smirnov (KS) Statistic:")
+        print(f"    - H-cDDIM: {ks_esh.statistic:.4f} (p-value: {ks_esh.pvalue:.4f})")
+        print(f"    - cDDIM:   {ks_cddim.statistic:.4f} (p-value: {ks_cddim.pvalue:.4f})")
 
         # Plot distributions
         sns.kdeplot(gt_stats[metric], ax=axes[i], label='Ground Truth', fill=True, color='blue')
-        sns.kdeplot(esh_stats[metric], ax=axes[i], label=f'ESH-cDDIM (W-dist: {w_dist_esh:.2f})', fill=True, color='green')
+        sns.kdeplot(esh_stats[metric], ax=axes[i], label=f'H-cDDIM (W-dist: {w_dist_esh:.2f})', fill=True, color='green')
         sns.kdeplot(cddim_stats[metric], ax=axes[i], label=f'cDDIM (W-dist: {w_dist_cddim:.2f})', fill=True, color='red')
         axes[i].set_title(f'Distribution of {metric.replace("_", " ").title()}')
         axes[i].legend()
@@ -223,6 +268,85 @@ def run_hardware_specific_fidelity_test(esh_inference, cddim_inference, dataset_
     with open(results_path, 'w') as f:
         json.dump(results, f, indent=2)
     print(f"✓ Fidelity comparison results saved to {results_path}")
+
+    # 4. Save the generated channels for re-plotting
+    channel_data_path = os.path.join(save_dir, 'fidelity_test_channels.npz')
+    np.savez_compressed(
+        channel_data_path,
+        gt_channels=gt_channels.cpu().numpy(),
+        esh_generated=esh_generated.cpu().numpy(),
+        cddim_generated=cddim_generated.cpu().numpy()
+    )
+    print(f"✓ Channel data for re-plotting saved to {channel_data_path}")
+
+
+def replot_fidelity_results(data_path: str, save_dir: str):
+    """
+    Loads saved channel data and regenerates the fidelity comparison plot.
+    """
+    print(f"\n=== Re-plotting Fidelity Results from {data_path} ===")
+    
+    try:
+        data = np.load(data_path)
+        gt_channels = torch.from_numpy(data['gt_channels'])
+        esh_generated = torch.from_numpy(data['esh_generated'])
+        cddim_generated = torch.from_numpy(data['cddim_generated'])
+    except Exception as e:
+        print(f"Error: Could not load data from {data_path}. {e}")
+        return
+
+    # We need an inference object to access the calculate_channel_statistics method.
+    # We can create a dummy one since we don't need a loaded model.
+    dummy_inference = ESHcDDIMInference.__new__(ESHcDDIMInference)
+
+    # Calculate statistics
+    gt_stats = dummy_inference.calculate_channel_statistics(gt_channels)
+    esh_stats = dummy_inference.calculate_channel_statistics(esh_generated)
+    cddim_stats = dummy_inference.calculate_channel_statistics(cddim_generated)
+
+    # Re-generate the plot with new labels
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    fig.suptitle('Hardware-Specific Fidelity Comparison', fontsize=16)
+
+    metrics_to_compare = ['capacity', 'frobenius_norm']
+
+    print("\nRecalculating quantitative metrics from saved data:")
+    for i, metric in enumerate(metrics_to_compare):
+        # Wasserstein distance
+        w_dist_esh = wasserstein_distance(gt_stats[metric], esh_stats[metric])
+        w_dist_cddim = wasserstein_distance(gt_stats[metric], cddim_stats[metric])
+        
+        # MMD
+        mmd_esh = calculate_mmd(gt_stats[metric], esh_stats[metric])
+        mmd_cddim = calculate_mmd(gt_stats[metric], cddim_stats[metric])
+
+        # KS Statistic
+        ks_esh = ks_2samp(gt_stats[metric], esh_stats[metric])
+        ks_cddim = ks_2samp(gt_stats[metric], cddim_stats[metric])
+
+        print(f"\n--- Metrics for {metric.replace('_', ' ').title()} ---")
+        print(f"  Wasserstein Distance:")
+        print(f"    - H-cDDIM: {w_dist_esh:.4f}")
+        print(f"    - cDDIM:   {w_dist_cddim:.4f}")
+        print(f"  Maximum Mean Discrepancy (MMD):")
+        print(f"    - H-cDDIM: {mmd_esh:.4f}")
+        print(f"    - cDDIM:   {mmd_cddim:.4f}")
+        print(f"  Kolmogorov-Smirnov (KS) Statistic:")
+        print(f"    - H-cDDIM: {ks_esh.statistic:.4f} (p-value: {ks_esh.pvalue:.4f})")
+        print(f"    - cDDIM:   {ks_cddim.statistic:.4f} (p-value: {ks_cddim.pvalue:.4f})")
+
+        # USE THE NEW "H-cDDIM" LABEL HERE
+        sns.kdeplot(gt_stats[metric], ax=axes[i], label='Ground Truth', fill=True, color='blue')
+        sns.kdeplot(esh_stats[metric], ax=axes[i], label=f'H-cDDIM (W-dist: {w_dist_esh:.2f})', fill=True, color='green')
+        sns.kdeplot(cddim_stats[metric], ax=axes[i], label=f'cDDIM (W-dist: {w_dist_cddim:.2f})', fill=True, color='red')
+        axes[i].set_title(f'Distribution of {metric.replace("_", " ").title()}')
+        axes[i].legend()
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    save_path = os.path.join(save_dir, 'comparison_fidelity_test_replotted.png')
+    plt.savefig(save_path, dpi=300)
+    plt.show()
+    print(f"✓ Re-plotted fidelity comparison plot saved to {save_path}")
 
 
 def run_cross_hardware_test(esh_inference, cddim_inference, dataset_path, save_dir, n_avg_samples=50):
@@ -329,12 +453,21 @@ def main():
     parser.add_argument('--esh_model_path', type=str, required=True, help='Path to the trained ESH-cDDIM model checkpoint')
     parser.add_argument('--cddim_model_path', type=str, required=True, help='Path to the trained baseline cDDIM model checkpoint')
     parser.add_argument('--dataset_path', type=str, default="../../datasets/DeepMIMO_dataset_full", help='Path to the DeepMIMO test dataset')
-    parser.add_argument('--mode', type=str, default='all', choices=['all', 'fidelity', 'cross_hardware'], help='Comparison mode to run')
+    parser.add_argument('--mode', type=str, default='all', choices=['all', 'fidelity', 'cross_hardware', 'replot'], help='Comparison mode to run')
     parser.add_argument('--save_dir', type=str, default='./results/comparison', help='Directory to save comparison results')
     parser.add_argument('--n_avg_samples', type=int, default=50, help='Number of samples to generate for averaging in cross-hardware test')
+    parser.add_argument('--replot_data_path', type=str, help='Path to .npz file with channel data for re-plotting')
     args = parser.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
+
+    if args.mode == 'replot':
+        if not args.replot_data_path:
+            print("Error: --mode replot requires --replot_data_path to be set.")
+            sys.exit(1)
+        replot_fidelity_results(args.replot_data_path, args.save_dir)
+        print("\n✓ Re-plotting finished.")
+        return
 
     # Initialize inference engines for both models
     esh_inference = ESHcDDIMInference(args.esh_model_path)
