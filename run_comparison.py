@@ -284,9 +284,9 @@ def run_cross_hardware_test(esh_inference, cddim_inference, dataset_path, save_d
     print(f"Config B: {config_b}")
 
     # 2. Prepare conditioning vectors
-    esh_cond_a = torch.tensor([list(test_location) + list(config_a_tuple)]).float()
-    esh_cond_b = torch.tensor([list(test_location) + list(config_b_tuple)]).float()
-    cddim_cond = torch.tensor([test_location]).float()
+    esh_cond_a = torch.tensor([list(test_location.flatten()) + list(config_a_tuple)]).float()
+    esh_cond_b = torch.tensor([list(test_location.flatten()) + list(config_b_tuple)]).float()
+    cddim_cond = torch.tensor([test_location.flatten()]).float()
 
     # 3. Generate channels
     print("Generating channels for cross-hardware comparison...")
