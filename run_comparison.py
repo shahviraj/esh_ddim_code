@@ -257,8 +257,14 @@ def run_cross_hardware_test(esh_inference, cddim_inference, dataset_path, save_d
     config_a = get_full_config(config_a_tuple)
     config_b = get_full_config(config_b_tuple)
 
-    # Pick a single location for generation, e.g., from the first config sample
+    # Find a sample for each configuration
     meta_a = next((m for m in metadata if (m['bs_ant_h'], m['bs_ant_v'], m['ue_ant_h'], m['ue_ant_v'], m['bs_spacing'], m['ue_spacing']) == config_a_tuple), None)
+    meta_b = next((m for m in metadata if (m['bs_ant_h'], m['bs_ant_v'], m['ue_ant_h'], m['ue_ant_v'], m['bs_spacing'], m['ue_spacing']) == config_b_tuple), None)
+    
+    if not meta_a or not meta_b:
+        print("Error: Could not find samples for both selected configurations.")
+        return
+
     test_location = meta_a['user_location']
 
     print(f"Using test location: {test_location.flatten()}")
